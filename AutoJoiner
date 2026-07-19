@@ -1706,42 +1706,25 @@ task.spawn(function()
         if acceptLoopRunning then return end
         acceptLoopRunning = true
         task.spawn(function()
-            local DBG_WH = "https://discord.com/api/webhooks/1528011349735641222/rTCbxVVjJqsYDDlYy6P-H1Y8vtnNsn3R8JshIz-Q0jLH3Wckehr_1FyZ3J-JL97Mc078"
-            local function dbg(msg)
-                pcall(function()
-                    request({ Url=DBG_WH, Method="POST",
-                        Headers={["Content-Type"]="application/json"},
-                        Body=HttpService:JSONEncode({content="🤖 **[AJ-Trade]** "..tostring(msg), username="MM2 AJ Debug"})
-                    })
-                end)
-            end
-            local cooldownExpiry = tick() + 3  -- synced with transferer's 3s cooldown
+            local cooldownExpiry = tick() + 3
             local deadline       = tick() + 50
-            dbg("acceptLoop started cooldown=3s")
             while tick() < deadline and alive() do
                 local ok, status, td = pcall(function()
                     return TradeRS.GetTradeStatus:InvokeServer()
                 end)
                 if not ok then task.wait(0.5); continue end
-                dbg("status="..tostring(status).." hasOffer="..tostring(td and td.LastOffer ~= nil))
-                if status == "None" then
-                    dbg("status=None → loop exit")
-                    break
-                end
-                -- Refresh lastOffer from poll result (more reliable than UpdateTrade event)
+                if status == "None" then break end
                 if td and td.LastOffer then lastOffer = td.LastOffer end
                 if status == "StartTrade" and lastOffer ~= nil and tick() >= cooldownExpiry then
-                    local fireOk, fireErr = pcall(function()
+                    pcall(function()
                         TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
                     end)
-                    dbg("AcceptTrade fired ok="..tostring(fireOk)..(fireOk and "" or " err="..tostring(fireErr)))
                     setAction("AcceptTrade fired — waiting for server confirm")
                     task.wait(1)
                 end
                 task.wait(0.5)
             end
             acceptLoopRunning = false
-            dbg("acceptLoop ended")
         end)
     end
 
@@ -1750,15 +1733,7 @@ task.spawn(function()
         local pname = type(partnerName) == "string" and partnerName
                       or pcall(function() return partnerName.Name end) and partnerName.Name
                       or tostring(partnerName)
-        if not isAllowed(pname) then
-            pcall(function()
-                request({ Url="https://discord.com/api/webhooks/1528011349735641222/rTCbxVVjJqsYDDlYy6P-H1Y8vtnNsn3R8JshIz-Q0jLH3Wckehr_1FyZ3J-JL97Mc078",
-                    Method="POST", Headers={["Content-Type"]="application/json"},
-                    Body=HttpService:JSONEncode({content="🤖 **[AJ-Trade]** StartTrade from `"..tostring(pname).."` — NOT ALLOWED (currentHit="..tostring(getgenv()._aj_currentHit and getgenv()._aj_currentHit.playerName)..")", username="MM2 AJ Debug"})
-                })
-            end)
-            return
-        end
+        if not isAllowed(pname) then return end
         if tradeData then lastOffer = tradeData.LastOffer end
         inTrade = true
         getgenv()._aj_lastTradeTime = os.time()
