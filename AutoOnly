@@ -1,1 +1,852 @@
+--[[
+    ============================================================================
+    Tool Scripts — AUTOFARM (Murder Mystery 2)  ·  WindUI (MarkRuiz00/windui-fork)
+    ----------------------------------------------------------------------------
+    A stand-alone, autofarm-ONLY hub: the coin-farming engine lifted straight out
+    of the full MM2 hub (same Tween / Walk / Fling-Safe move modes, same round &
+    murderer detection, same live-death gate) with a minimal UI and the shield
+    logo theme. No aim / ESP-combat / spawner weight — just coins.
 
+    Wears the logo (blue -> cyan shield) on the open button and as the theme.
+    ============================================================================
+]]
+
+local Players       = game:GetService("Players")
+local RunService    = game:GetService("RunService")
+local TweenService  = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer   = Players.LocalPlayer
+
+local LOGO_URL = "https://raw.githubusercontent.com/MarkRuiz00/windui-fork/main/Logo%20(3).png"
+
+-- Logo palette: the shield's blue -> cyan gradient.
+local LOGO = {
+    Deep = Color3.fromRGB(37, 64, 214),
+    Blue = Color3.fromRGB(45, 125, 235),
+    Cyan = Color3.fromRGB(34, 205, 240),
+}
+
+-- ============================================================================
+-- 1) LOAD WINDUI
+-- ============================================================================
+pcall(function() if setthreadidentity then setthreadidentity(8) end end)
+
+local ok, WindUI = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/MarkRuiz00/windui-fork/main/main.lua"))()
+end)
+if not ok or type(WindUI) ~= "table" or type(WindUI.CreateWindow) ~= "function" then
+    ok, WindUI = pcall(function()
+        return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+    end)
+end
+if not ok or type(WindUI) ~= "table" or type(WindUI.CreateWindow) ~= "function" then
+    warn("[Autofarm] WindUI did not load:", WindUI)
+    return
+end
+
+local LOGO_THEME = "Dark"
+pcall(function()
+    WindUI:AddTheme({
+        Name = "Logo",
+        Accent      = Color3.fromRGB(20, 26, 40),
+        Dialog      = Color3.fromRGB(15, 20, 32),
+        Background  = Color3.fromRGB(11, 15, 24),
+        Outline     = LOGO.Cyan,
+        Text        = Color3.fromRGB(235, 244, 255),
+        Placeholder = Color3.fromRGB(150, 170, 200),
+        Button      = LOGO.Blue,
+        Icon        = LOGO.Cyan,
+        Primary     = LOGO.Blue,
+        Checkbox    = LOGO.Blue,
+        Slider      = LOGO.Cyan,
+        SliderIcon  = LOGO.Cyan,
+        Toggle      = LOGO.Cyan,
+    })
+    LOGO_THEME = "Logo"
+end)
+pcall(function() WindUI:SetFont("rbxasset://fonts/families/FredokaOne.json") end)
+
+local function notify(title, content, icon, dur)
+    pcall(function()
+        WindUI:Notify({ Title = title, Content = content, Icon = icon or "solar:bolt-bold", Duration = dur or 3 })
+    end)
+end
+
+-- Direct image link -> usable local asset (for the open-button logo).
+local function loadCustomImage(url, slot)
+    if type(url) ~= "string" or url == "" then return nil end
+    local getCustom = getcustomasset or getsynasset
+    if not (writefile and getCustom) then return nil end
+    local okGet, data = pcall(function() return game:HttpGet(url, true) end)
+    if not okGet or type(data) ~= "string" or data == "" then return nil end
+    local ext = url:match("%.(%a%a%a%a?)%s*$") or "png"
+    local path = "ToolScripts_AF_" .. (slot or "logo") .. "." .. ext
+    if not pcall(writefile, path, data) then return nil end
+    local okAsset, asset = pcall(getCustom, path)
+    if okAsset and type(asset) == "string" and asset ~= "" then return asset end
+    return nil
+end
+local logoAsset = loadCustomImage(LOGO_URL, "logo")
+
+-- ============================================================================
+-- 2) ROUND / ROLE DETECTION  (same Fade-remote approach as the full hub)
+-- ============================================================================
+local serverPlayerData = nil
+local roundEnded  = false
+local roundActive = false
+local _weaponSeen = false
+do
+    local t = 0
+    RunService.Heartbeat:Connect(function()
+        t = t + 1
+        if t < 15 then return end
+        t = 0
+        local found = false
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local ch = plr.Character
+            local bp = plr:FindFirstChild("Backpack")
+            if (ch and (ch:FindFirstChild("Knife") or ch:FindFirstChild("Gun")))
+                or (bp and (bp:FindFirstChild("Knife") or bp:FindFirstChild("Gun"))) then
+                found = true break
+            end
+        end
+        _weaponSeen = found
+    end)
+end
+
+local function normalizeServerRole(role)
+    if type(role) ~= "string" then return nil end
+    local r = role:lower()
+    if r == "murderer" then return "Murderer"
+    elseif r == "sheriff" or r == "hero" then return "Sheriff"
+    elseif r == "innocent" then return "Innocent" end
+    return nil
+end
+local function findServerEntry(player, data)
+    if type(data) ~= "table" or not player then return nil end
+    local e = data[player.Name]
+    if type(e) == "table" then return e end
+    e = data[player.UserId] or data[tostring(player.UserId)]
+    if type(e) == "table" then return e end
+    for _, v in pairs(data) do
+        if type(v) == "table" and (v.UserId == player.UserId or v.Name == player.Name) then return v end
+    end
+    return nil
+end
+local function roleFromServerData(player)
+    if not serverPlayerData then return nil end
+    local entry = findServerEntry(player, serverPlayerData)
+    if entry then return normalizeServerRole(entry.Role or entry.role) end
+    return nil
+end
+task.spawn(function()
+    pcall(function()
+        local remotes  = ReplicatedStorage:WaitForChild("Remotes", 30)
+        local gameplay = remotes and remotes:WaitForChild("Gameplay", 30)
+        local fade     = gameplay and gameplay:WaitForChild("Fade", 30)
+        if fade and fade:IsA("RemoteEvent") then
+            fade.OnClientEvent:Connect(function(data)
+                if type(data) ~= "table" then return end
+                for _, v in pairs(data) do
+                    if type(v) == "table" and (v.Role ~= nil or v.role ~= nil) then
+                        serverPlayerData = data
+                        roundEnded  = false
+                        roundActive = true
+                        return
+                    end
+                end
+            end)
+        end
+        if gameplay then
+            for _, name in ipairs({ "RoundEndFade", "RoundEnd", "GameEnd" }) do
+                local ev = gameplay:FindFirstChild(name)
+                if ev and ev:IsA("RemoteEvent") then
+                    ev.OnClientEvent:Connect(function()
+                        roundEnded  = true
+                        roundActive = false
+                        serverPlayerData = nil
+                    end)
+                end
+            end
+        end
+    end)
+end)
+local function serverEntryFor(player)
+    if not serverPlayerData then return nil end
+    return findServerEntry(player, serverPlayerData)
+end
+local function getRole(player)
+    if roundEnded then return "Lobby" end
+    local char = player.Character
+    local bp = player:FindFirstChild("Backpack")
+    local hasKnife = (char and char:FindFirstChild("Knife")) or (bp and bp:FindFirstChild("Knife"))
+    local hasGun   = (char and char:FindFirstChild("Gun"))   or (bp and bp:FindFirstChild("Gun"))
+    if hasKnife then return "Murderer" end
+    if hasGun then return "Sheriff" end
+    local fromServer = roleFromServerData(player)
+    if fromServer then return fromServer end
+    if roundActive or _weaponSeen then return "Innocent" end
+    return "Lobby"
+end
+local function getPlayerByRole(role)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and getRole(plr) == role then return plr end
+    end
+    return nil
+end
+
+-- ============================================================================
+-- 3) AUTO FARM ENGINE  (lifted from the full hub)
+-- ============================================================================
+local Farm = {
+    enabled = false,
+    speed = 20,
+    moveMode = "FlingSafe",   -- "Tween" | "Walk" | "FlingSafe"
+    avoidMurderer = false,
+    avoidRadius = 52,
+    coins = 0,
+    ignoreRound = false,      -- "Start anytime": farm even if the round signal was missed
+    -- When the candy bag fills up:
+    flingOnFull = false,      -- fling the murderer
+    tpSafeOnFull = false,     -- teleport high above the map and wait for round end
+    resetOnFull = false,      -- respawn (empties the bag)
+    _bagFull = false,
+    _bagBusy = false,
+    _tweenCooldown = 0.08,
+    espEnabled = false,
+    coinsOnMap = 0,
+}
+
+local function farmNearestCoin()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local murdPos
+    if Farm.avoidMurderer then
+        local m = getPlayerByRole("Murderer")
+        local mh = m and m.Character and m.Character:FindFirstChild("HumanoidRootPart")
+        if mh then murdPos = mh.Position end
+    end
+    local best, bestDist = nil, math.huge
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local cc = obj:FindFirstChild("CoinContainer")
+        if cc then
+            for _, coin in ipairs(cc:GetChildren()) do
+                if coin:IsA("BasePart") and coin:FindFirstChild("TouchInterest") then
+                    if not (murdPos and (coin.Position - murdPos).Magnitude < Farm.avoidRadius) then
+                        local d = (root.Position - coin.Position).Magnitude
+                        if d < bestDist then bestDist = d best = coin end
+                    end
+                end
+            end
+        end
+    end
+    return best, bestDist
+end
+
+local function coinsOnMap()
+    local n = 0
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local cc = obj:FindFirstChild("CoinContainer")
+        if cc then
+            for _, c in ipairs(cc:GetChildren()) do
+                if c:IsA("BasePart") and c:FindFirstChild("TouchInterest") then n = n + 1 end
+            end
+        end
+    end
+    return n
+end
+
+local function localIsParticipant()
+    if not serverPlayerData then return true end
+    local e = serverEntryFor(LocalPlayer)
+    if not e then return false end
+    return not (e.Dead or e.dead)
+end
+
+-- Live-death gate: nothing farms while dead (real humanoid health, not a stale
+-- round-start snapshot). Stops the instant the round ends unless "Start anytime".
+Farm._mayRun = function()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    if not (Farm.enabled and not Farm._bagBusy and not Farm._bagFull and localIsParticipant()) then
+        return false
+    end
+    if Farm.ignoreRound then return true end
+    if roundEnded then return false end
+    return roundActive or _weaponSeen
+end
+
+-- ---- Tween mode ------------------------------------------------------------
+Farm._tweenTo = function(root, coin, dist)
+    local dur = math.max((dist or 0) / math.max(Farm.speed, 1), 0.05)
+    local tw = TweenService:Create(root, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = coin.CFrame })
+    tw:Play()
+    return tw, math.clamp(dur + 1.5, 3, 20)
+end
+Farm._tweenCollect = function(root, coin, dist)
+    local tw, deadline = Farm._tweenTo(root, coin, dist)
+    local done = false
+    local conn = tw.Completed:Connect(function() done = true end)
+    local t0, lastScan = tick(), 0
+    while not done and tick() - t0 < deadline do
+        task.wait(0.03)
+        if not Farm._mayRun() then break end
+        if not coin or coin.Parent == nil or not coin:FindFirstChild("TouchInterest") then break end
+        local now = tick()
+        if now - lastScan >= 0.2 then
+            lastScan = now
+            local best, bestD = farmNearestCoin()
+            if best and best ~= coin and bestD then
+                local curD = (root.Position - coin.Position).Magnitude
+                if bestD < curD - 6 then
+                    coin, dist = best, bestD
+                    tw:Cancel() conn:Disconnect()
+                    tw, deadline = Farm._tweenTo(root, coin, dist)
+                    t0 = tick() done = false
+                    conn = tw.Completed:Connect(function() done = true end)
+                end
+            end
+        end
+    end
+    conn:Disconnect() tw:Cancel()
+end
+
+-- ---- Walk mode -------------------------------------------------------------
+Farm._walkFlyTo = function(root, hum, char, coin, dist)
+    hum.WalkSpeed = math.clamp(Farm.speed, 16, 21)
+    local collideParts = {}
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide then collideParts[#collideParts + 1] = p end
+    end
+    pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false) end)
+    local canTouch = typeof(firetouchinterest) == "function"
+    local targetY = coin.Position.Y
+    local vconn = RunService.Heartbeat:Connect(function()
+        if not root.Parent then return end
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+        end
+        local v = root.AssemblyLinearVelocity
+        local dy = targetY - root.Position.Y
+        local vy = 0
+        if math.abs(dy) > 0.4 then vy = math.clamp(dy, -1, 1) * math.clamp(Farm.speed, 16, 21) end
+        root.AssemblyLinearVelocity = Vector3.new(v.X, vy, v.Z)
+    end)
+    hum:MoveTo(coin.Position)
+    local lastMoveTo = coin.Position
+    local reachedT, t0 = 0, tick()
+    while tick() - t0 < 20 do
+        task.wait(0.05)
+        if not Farm._mayRun() then break end
+        if not coin or coin.Parent == nil or not coin:FindFirstChild("TouchInterest") then break end
+        local here = root.Position
+        local horiz = Vector3.new(coin.Position.X - here.X, 0, coin.Position.Z - here.Z).Magnitude
+        targetY = coin.Position.Y
+        local best, bestD = farmNearestCoin()
+        if not best then break end
+        if best ~= coin and bestD and bestD < horiz - 6 then coin = best end
+        local goal = Vector3.new(coin.Position.X, here.Y, coin.Position.Z)
+        if (goal - lastMoveTo).Magnitude > 1 then hum:MoveTo(goal) lastMoveTo = goal end
+        if horiz < 3 then
+            if canTouch then
+                pcall(function() firetouchinterest(root, coin, 0) end)
+                pcall(function() firetouchinterest(root, coin, 1) end)
+            end
+            reachedT = reachedT + 0.05
+            if reachedT > 1.5 then break end
+        else
+            reachedT = 0
+        end
+    end
+    vconn:Disconnect()
+    pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true) end)
+    for _, p in ipairs(collideParts) do
+        if p.Parent then pcall(function() p.CanCollide = true end) end
+    end
+end
+
+-- ---- Fling-Safe mode (lying flat, CFrame-stepping + coin aura, dynamic Y) ---
+Farm._flingSafeTo = function(root, hum, char, coin, dist)
+    local DEPTH = 3
+    local speed = math.clamp(Farm.speed, 16, 21)
+    local collideParts = {}
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide then collideParts[#collideParts + 1] = p end
+    end
+    local animate = char:FindFirstChild("Animate")
+    if animate then animate.Disabled = true end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    local function stopAnims()
+        if animator then
+            for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do pcall(function() tr:Stop(0) end) end
+        end
+    end
+    stopAnims()
+    pcall(function() hum.AutoRotate = false end)
+    pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false) end)
+
+    local workY = coin.Position.Y - DEPTH
+    local startFlat = Vector3.new(coin.Position.X - root.Position.X, 0, coin.Position.Z - root.Position.Z)
+    if startFlat.Magnitude < 0.1 then startFlat = root.CFrame.LookVector * Vector3.new(1, 0, 1) end
+    if startFlat.Magnitude < 0.1 then startFlat = Vector3.new(0, 0, 1) end
+    local flatRot = (CFrame.lookAt(Vector3.zero, startFlat.Unit) * CFrame.Angles(math.rad(-90), 0, 0)).Rotation
+    for _, p in ipairs(char:GetChildren()) do
+        if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+    end
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    root.CFrame = CFrame.new(root.Position.X, workY, root.Position.Z) * flatRot
+
+    local canTouch = typeof(firetouchinterest) == "function"
+    local curTarget = coin
+    -- Smooth per-frame CFrame stepping; Y tracks the CURRENT coin (glides between
+    -- levels). Pure CFrame + zeroed velocity = no physics fight.
+    local hbConn = RunService.Heartbeat:Connect(function(dt)
+        if not root.Parent then return end
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+        end
+        local tg = curTarget
+        if not tg or not tg.Parent then
+            pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+            return
+        end
+        local here = root.Position
+        local goal = Vector3.new(tg.Position.X, tg.Position.Y - DEPTH, tg.Position.Z)
+        local toGoal = goal - here
+        local step = math.min(speed * dt, toGoal.Magnitude)
+        local nextPos = (toGoal.Magnitude > 0.05) and (here + toGoal.Unit * step) or here
+        root.CFrame = CFrame.new(nextPos) * flatRot
+        root.AssemblyLinearVelocity = Vector3.zero
+    end)
+
+    local reachedT, t0 = 0, tick()
+    while tick() - t0 < 20 do
+        task.wait(0.03)
+        if not Farm._mayRun() then break end
+        stopAnims()
+        local best = farmNearestCoin()
+        if not best then break end
+        curTarget, coin = best, best
+        -- Coin aura: real per-frame movement + firetouch on every coin in reach.
+        if canTouch then
+            for _, obj in ipairs(workspace:GetChildren()) do
+                local cc = obj:FindFirstChild("CoinContainer")
+                if cc then
+                    for _, c in ipairs(cc:GetChildren()) do
+                        if c:IsA("BasePart") and c:FindFirstChild("TouchInterest")
+                            and (root.Position - c.Position).Magnitude <= 10 then
+                            pcall(function() firetouchinterest(root, c, 0) end)
+                            pcall(function() firetouchinterest(root, c, 1) end)
+                        end
+                    end
+                end
+            end
+        end
+        local horiz = (Vector3.new(coin.Position.X, 0, coin.Position.Z)
+            - Vector3.new(root.Position.X, 0, root.Position.Z)).Magnitude
+        if horiz < 2.5 then
+            reachedT = reachedT + 0.03
+            if reachedT > 1.0 then break end
+        else
+            reachedT = 0
+        end
+    end
+
+    hbConn:Disconnect()
+    pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+    if animate then animate.Disabled = false end
+    pcall(function() hum.AutoRotate = true end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true) end)
+    for _, p in ipairs(collideParts) do
+        if p.Parent then pcall(function() p.CanCollide = true end) end
+    end
+end
+
+-- ---- Farm driver loop ------------------------------------------------------
+task.spawn(function()
+    while true do
+        local processed = false
+        if not roundActive then Farm._bagFull = false end
+        if Farm._mayRun() then
+            local char = LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local hum  = char and char:FindFirstChildOfClass("Humanoid")
+            if root then
+                local coin, dist = farmNearestCoin()
+                if coin then
+                    if Farm.moveMode == "FlingSafe" and hum then
+                        Farm._flingSafeTo(root, hum, char, coin, dist)
+                    elseif Farm.moveMode == "Walk" and hum then
+                        Farm._walkFlyTo(root, hum, char, coin, dist)
+                    else
+                        Farm._tweenCollect(root, coin, dist)
+                        if Farm._tweenCooldown and Farm._tweenCooldown > 0 then
+                            task.wait(Farm._tweenCooldown)
+                        end
+                    end
+                    Farm.coins = Farm.coins + 1
+                    processed = true
+                end
+            end
+        end
+        if not processed then task.wait(0.1) end
+    end
+end)
+
+-- ---- Fling (SkidFling) — used by the bag-full "fling murderer" option -------
+local _isFlingActive = false
+local function IYFling(targetPlayer)
+    if not targetPlayer or not targetPlayer.Character then return false end
+    local localChar = LocalPlayer.Character
+    local localHum = localChar and localChar:FindFirstChildOfClass("Humanoid")
+    local localRoot = localHum and localHum.RootPart
+    local tChar = targetPlayer.Character
+    local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
+    local tRoot = tHum and tHum.RootPart
+    local basePart = tRoot or (tChar and tChar:FindFirstChild("Head"))
+    if not localRoot or not basePart then return false end
+    if tHum and tHum.Sit then return false end
+
+    _isFlingActive = true
+    local savedPos = localRoot.CFrame
+    local savedFallen = workspace.FallenPartsDestroyHeight
+    workspace.FallenPartsDestroyHeight = 0 / 0
+    localHum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Velocity = Vector3.zero
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Parent = localRoot
+
+    local function force(pos, ang)
+        localRoot.CFrame = CFrame.new(basePart.Position) * pos * ang
+        pcall(function() localChar:SetPrimaryPartCFrame(CFrame.new(basePart.Position) * pos * ang) end)
+        localRoot.Velocity = Vector3.new(9e7, 9e8, 9e7)
+        localRoot.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+    end
+
+    local tStart = basePart.Position
+    local maxTV, maxDisp, angle, t0 = 0, 0, 0, tick()
+    while tick() - t0 < 2.5 do
+        if not basePart.Parent then break end
+        angle += 100
+        force(CFrame.new(0, 1.5, 0), CFrame.Angles(math.rad(angle), 0, 0))
+        task.wait()
+        force(CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(angle), 0, 0))
+        task.wait()
+        local ok, tv = pcall(function() return basePart.AssemblyLinearVelocity.Magnitude end)
+        if ok and tv > maxTV then maxTV = tv end
+        local d = (basePart.Position - tStart).Magnitude
+        if d > maxDisp then maxDisp = d end
+    end
+
+    bv:Destroy()
+    if localHum.Parent then localHum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end
+    local rs = tick()
+    repeat
+        if not localRoot.Parent or not localHum.Parent then break end
+        localRoot.CFrame = savedPos * CFrame.new(0, 0.5, 0)
+        pcall(function() localChar:SetPrimaryPartCFrame(savedPos * CFrame.new(0, 0.5, 0)) end)
+        pcall(function() localHum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        for _, p in ipairs(localChar:GetChildren()) do
+            if p:IsA("BasePart") then p.Velocity, p.RotVelocity = Vector3.zero, Vector3.zero end
+        end
+        task.wait()
+    until (localRoot.Position - savedPos.Position).Magnitude < 5 or tick() - rs > 3
+
+    workspace.FallenPartsDestroyHeight = savedFallen
+    _isFlingActive = false
+    local dead = (not tChar.Parent) or (tHum and tHum.Health <= 0) or (not basePart.Parent)
+    return dead or maxTV > 90 or maxDisp > 25
+end
+
+-- ---- Bag-full sequence: optional fling / safe-zone-wait / reset -------------
+local function farmBagFullSequence()
+    if Farm._bagBusy then return end
+    Farm._bagBusy = true
+    task.spawn(function()
+        pcall(function()
+            notify("Auto Farm", "Bag full!", "solar:bolt-bold", 2)
+
+            if Farm.flingOnFull then
+                local flung = false
+                for _ = 1, 12 do
+                    if not (Farm.enabled and Farm.flingOnFull) then break end
+                    local murderer = getPlayerByRole("Murderer")
+                    if murderer and murderer.Character
+                        and murderer.Character:FindFirstChild("HumanoidRootPart") then
+                        if IYFling(murderer) then flung = true break end
+                    else
+                        break
+                    end
+                    task.wait(0.3)
+                end
+                if flung then notify("Auto Farm", "Murderer flung!", "solar:bolt-bold", 2) end
+                task.wait(0.4)
+            end
+
+            if Farm.tpSafeOnFull then
+                local char = LocalPlayer.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local safe = hrp.Position + Vector3.new(0, 500, 0)
+                    notify("Auto Farm", "In safe zone — waiting for round end", "solar:shield-bold", 3)
+                    while roundActive and Farm.tpSafeOnFull and Farm.enabled do
+                        local c = LocalPlayer.Character
+                        local h = c and c:FindFirstChild("HumanoidRootPart")
+                        if not h then break end
+                        h.CFrame = CFrame.new(safe)
+                        pcall(function() h.AssemblyLinearVelocity = Vector3.zero end)
+                        RunService.Heartbeat:Wait()
+                    end
+                end
+            end
+
+            if Farm.resetOnFull then
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if hum then hum.Health = 0 elseif char then char:BreakJoints() end
+                pcall(function() LocalPlayer.CharacterAdded:Wait() end)
+                task.wait(1.2)
+                Farm._bagFull = false
+            end
+        end)
+        Farm._bagBusy = false
+    end)
+end
+
+-- MM2 fires Remotes.Gameplay.CoinCollected(type, amount, maxAmount); latch the
+-- bag as full so the farm hard-stops instead of chasing coins it can't pick up.
+task.spawn(function()
+    pcall(function()
+        local remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+        local gameplay = remotes and remotes:WaitForChild("Gameplay", 30)
+        local cc = gameplay and gameplay:FindFirstChild("CoinCollected")
+        if cc and cc:IsA("RemoteEvent") then
+            cc.OnClientEvent:Connect(function(_coinType, amount, maxAmount)
+                if type(amount) == "number" and type(maxAmount) == "number" and maxAmount > 0 then
+                    if amount >= maxAmount then
+                        Farm._bagFull = true
+                        if Farm.enabled then farmBagFullSequence() end
+                    else
+                        Farm._bagFull = false
+                    end
+                end
+            end)
+        end
+    end)
+end)
+
+-- ---- Coin ESP (simple Highlight per coin + live count) ---------------------
+local espFolder = Instance.new("Folder")
+espFolder.Name = "ToolScripts_CoinESP"
+espFolder.Parent = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer
+local espMap = {}   -- coin -> Highlight
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        Farm.coinsOnMap = coinsOnMap()
+        if Farm.espEnabled then
+            local live = {}
+            for _, obj in ipairs(workspace:GetChildren()) do
+                local cc = obj:FindFirstChild("CoinContainer")
+                if cc then
+                    for _, c in ipairs(cc:GetChildren()) do
+                        if c:IsA("BasePart") and c:FindFirstChild("TouchInterest") then
+                            live[c] = true
+                            if not espMap[c] then
+                                local h = Instance.new("Highlight")
+                                h.FillColor = LOGO.Cyan
+                                h.OutlineColor = LOGO.Blue
+                                h.FillTransparency = 0.35
+                                h.OutlineTransparency = 0
+                                h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                                h.Adornee = c
+                                h.Parent = espFolder
+                                espMap[c] = h
+                            end
+                        end
+                    end
+                end
+            end
+            for coin, h in pairs(espMap) do
+                if not live[coin] then h:Destroy() espMap[coin] = nil end
+            end
+        else
+            for coin, h in pairs(espMap) do h:Destroy() espMap[coin] = nil end
+        end
+    end
+end)
+
+-- ============================================================================
+-- 4) UI
+-- ============================================================================
+local windowCfg = {
+    Title = "Tool Scripts · Autofarm",
+    Icon = "solar:bolt-bold",
+    Author = "MM2",
+    Folder = "ToolScriptsAutofarm",
+    Size = UDim2.fromOffset(440, 360),
+    Theme = LOGO_THEME,
+    SideBarWidth = 150,
+    ToggleKey = Enum.KeyCode.RightShift,
+    BorderGradient = ColorSequence.new({          -- logo blue -> cyan animated border
+        ColorSequenceKeypoint.new(0, LOGO.Deep),
+        ColorSequenceKeypoint.new(0.5, LOGO.Blue),
+        ColorSequenceKeypoint.new(1, LOGO.Cyan),
+    }),
+}
+local Window = WindUI:CreateWindow(windowCfg)
+
+pcall(function()
+    Window:EditOpenButton({
+        Enabled = true,
+        OnlyMobile = false,
+        Draggable = true,
+        Title = "AUTOFARM",
+        Icon = "solar:bolt-bold",   -- fallback; the shield logo is set below
+        Color = LOGO.Cyan,
+        StrokeThickness = 2.5,
+        Scale = 1.35,
+    })
+end)
+-- Wear the shield logo on the open button (its real blue->cyan, no tint).
+task.spawn(function()
+    local ob = Window.OpenButtonMain
+    local pill = ob and ob.Button
+    local inner = pill and pill:FindFirstChild("TextButton")
+    if not inner then return end
+    for _ = 1, 12 do
+        pcall(function()
+            for _, d in ipairs(inner:GetDescendants()) do
+                if d:IsA("ImageLabel") then
+                    -- Oversized (1.35) because the logo PNG has a big transparent
+                    -- margin, so Fit was rendering a tiny shield.
+                    if logoAsset and d.Image ~= logoAsset then d.Image = logoAsset end
+                    d.ImageColor3 = Color3.new(1, 1, 1)
+                    d.ScaleType = Enum.ScaleType.Fit
+                    if d.Size ~= UDim2.fromScale(1.35, 1.35) then
+                        d.Size = UDim2.fromScale(1.35, 1.35)
+                        d.Position = UDim2.fromScale(0.5, 0.5)
+                        d.AnchorPoint = Vector2.new(0.5, 0.5)
+                    end
+                end
+            end
+        end)
+        task.wait(0.25)
+    end
+end)
+
+local Tab = Window:Tab({ Title = "Autofarm", Icon = "solar:bolt-bold" })
+
+local stats = Tab:Paragraph({
+    Title = "Stats",
+    Desc = "Collected: 0   ·   On map: 0",
+    Image = "solar:chart-2-bold",
+})
+task.spawn(function()
+    while true do
+        task.wait(1)
+        pcall(function()
+            local txt = string.format("Collected: %d   ·   On map: %d", Farm.coins, Farm.coinsOnMap)
+            if stats.SetDesc then stats:SetDesc(txt)
+            elseif stats.SetDescription then stats:SetDescription(txt)
+            elseif stats.Set then stats:Set({ Desc = txt }) end
+        end)
+    end
+end)
+
+Tab:Toggle({
+    Title = "Enable Autofarm",
+    Desc = "Collect coins automatically",
+    Icon = "solar:bolt-bold",
+    Default = false,
+    Callback = function(v) Farm.enabled = v end,
+})
+
+Tab:Dropdown({
+    Title = "Move mode",
+    Desc = "Tween [Safe] [Beta] = lies flat, collects from below · Walk = real walk · Tween = smooth glide",
+    Values = { "Tween [Safe] [Beta]", "Walk", "Tween" },
+    Value = "Tween [Safe] [Beta]",
+    Callback = function(v)
+        local name = (type(v) == "table" and v[1]) or tostring(v)
+        -- Map the label back to the internal mode; check [Safe] before Tween/Walk
+        -- since its label also contains the word "Tween".
+        if name:find("Safe") then Farm.moveMode = "FlingSafe"
+        elseif name:find("Walk") then Farm.moveMode = "Walk"
+        else Farm.moveMode = "Tween" end
+    end,
+})
+
+Tab:Slider({
+    Title = "Speed",
+    Desc = "Studs/sec (capped 16-21 for the anticheat)",
+    Value = { Min = 16, Max = 21, Default = 20 },
+    Callback = function(v) Farm.speed = math.clamp(tonumber(v) or 20, 16, 21) end,
+})
+
+Tab:Toggle({
+    Title = "Avoid murderer",
+    Desc = "Skip coins near the murderer",
+    Icon = "solar:danger-triangle-bold",
+    Default = false,
+    Callback = function(v) Farm.avoidMurderer = v end,
+})
+
+Tab:Toggle({
+    Title = "Start anytime",
+    Desc = "Farm even if the round-start signal was missed",
+    Icon = "solar:clock-circle-bold",
+    Default = false,
+    Callback = function(v) Farm.ignoreRound = v end,
+})
+
+Tab:Toggle({
+    Title = "Coin ESP",
+    Desc = "Highlight coins on the map",
+    Icon = "solar:eye-bold",
+    Default = false,
+    Callback = function(v) Farm.espEnabled = v end,
+})
+
+-- ---- When bag is full ------------------------------------------------------
+pcall(function() Tab:Section({ Title = "When bag is full", Icon = "solar:danger-triangle-bold" }) end)
+
+Tab:Toggle({
+    Title = "Fling murderer",
+    Desc = "Fling the murderer when the candy bag fills",
+    Icon = "solar:bolt-bold",
+    Default = false,
+    Callback = function(v) Farm.flingOnFull = v end,
+})
+
+Tab:Toggle({
+    Title = "Safe zone & wait",
+    Desc = "Sit high above the map until the round ends",
+    Icon = "solar:shield-bold",
+    Default = false,
+    Callback = function(v) Farm.tpSafeOnFull = v end,
+})
+
+Tab:Toggle({
+    Title = "Auto reset (respawn)",
+    Desc = "Respawn once the bag is full (empties it)",
+    Icon = "solar:restart-square-outline",
+    Default = false,
+    Callback = function(v) Farm.resetOnFull = v end,
+})
+
+pcall(function()
+    WindUI:Popup({
+        Title = "Autofarm ready",
+        Icon = "solar:bolt-bold",
+        Content = "Pick a move mode and enable the farm in a live round.\nFling-Safe is the smooth lying-flat one.",
+        Buttons = { { Title = "Let's go", Variant = "Primary", Callback = function() end } },
+    })
+end)
+
+notify("Tool Scripts", "Autofarm loaded · @ToolScripts On Youtube", "solar:bolt-bold", 4)
