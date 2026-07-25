@@ -681,9 +681,425 @@ task.spawn(function()
     end
 end)
 
+-- ---- Keep Playing while autofarm -------------------------------------------
+-- The real character keeps farming (server-driven by the farm loop). A CLONE of
+-- your avatar is spawned CLIENT-SIDE and you walk it around the map freely — only
+-- YOU see it (it never replicates). The camera follows the clone and your normal
+-- movement input drives it, so you can keep playing while the coins farm.
+do
+    local UserInputService = game:GetService("UserInputService")
+    local clone, cloneHum, driveConn, savedSubject, realHighlight, realTag, toolMirror
+
+    local function cleanup()
+        if driveConn then driveConn:Disconnect() driveConn = nil end
+        if clone then pcall(function() clone:Destroy() end) clone = nil end
+        if realHighlight then pcall(function() realHighlight:Destroy() end) realHighlight = nil end
+        if realTag then pcall(function() realTag:Destroy() end) realTag = nil end
+        cloneHum, toolMirror = nil, nil
+        local cam = workspace.CurrentCamera
+        if cam then
+            local realHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            cam.CameraSubject = realHum or savedSubject
+        end
+    end
+
+    -- Spawn on the WALKABLE map: coins sit on the round floor, so a coin's spot is
+    -- the safest ground to drop the clone onto (raycasting from above the farming
+    -- body kept hitting the map ROOF -> spawned too high, couldn't get back in).
+    local function findSpawn(realChar, realRoot)
+        local coin = farmNearestCoin()
+        if coin then return coin.Position + Vector3.new(0, 3, 0) end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { realChar }
+        local res = workspace:Raycast(realRoot.Position + Vector3.new(0, 50, 0), Vector3.new(0, -500, 0), params)
+        return (res and res.Position + Vector3.new(0, 3, 0)) or (realRoot.Position + Vector3.new(0, 5, 0))
+    end
+
+    -- Pull the avatar's animation asset ids from the real Animate script (a cloned
+    -- Animate LocalScript does NOT run inside workspace, so the clone would stand
+    -- frozen — we drive the tracks ourselves instead).
+    local function getAnimIds(realChar)
+        local ids = {}
+        local a = realChar:FindFirstChild("Animate")
+        if not a then return ids end
+        -- "run" and "climb" were missing, so a sprinting clone kept playing the slow
+        -- walk cycle and a ladder left it in a T-pose. "toolnone" is the arm pose the
+        -- default Animate plays on its own track whenever a Tool is held - without it
+        -- the mirrored knife floats beside a limp arm.
+        for _, key in ipairs({ "idle", "walk", "run", "jump", "fall", "climb", "toolnone" }) do
+            local f = a:FindFirstChild(key)
+            local anim = f and f:FindFirstChildWhichIsA("Animation")
+            if anim then ids[key] = anim.AnimationId end
+        end
+        return ids
+    end
+
+    -- Roblox's own ControlModule move vector. Humanoid.MoveDirection is useless
+    -- here: the farm pins the real body in a Physics state (FlingSafe) so it reads
+    -- zero, and the old WASD fallback was PC-only, which left mobile unable to move
+    -- OR turn the clone at all. GetMoveVector keeps reporting on every device.
+    local getMoveVector
+    pcall(function()
+        local ps = LocalPlayer:WaitForChild("PlayerScripts", 5)
+        local pm = ps and require(ps:WaitForChild("PlayerModule", 5))
+        local ctrl = pm and pm:GetControls()
+        if ctrl then getMoveVector = function() return ctrl:GetMoveVector() end end
+    end)
+
+    -- Mirror the equipped weapon onto the clone as a COSMETIC copy. The real Tool
+    -- has to stay on the farming body (it owns the remotes), and the clone strips
+    -- every Tool, so as murderer/sheriff you were walking around empty-handed.
+    local function clearToolMirror()
+        if toolMirror then pcall(function() toolMirror:Destroy() end) end
+        toolMirror = nil
+    end
+    local function mirrorTool()
+        local realChar = LocalPlayer.Character
+        if not (clone and clone.Parent and realChar) then clearToolMirror() return end
+        local tool = realChar:FindFirstChildOfClass("Tool")
+        local handle = tool and tool:FindFirstChild("Handle")
+        if not handle then clearToolMirror() return end
+        if toolMirror and toolMirror.Parent and toolMirror:GetAttribute("SrcTool") == tool.Name then return end
+        clearToolMirror()
+
+        local hand = clone:FindFirstChild("RightHand") or clone:FindFirstChild("Right Arm")
+        if not hand then return end
+
+        local holder = Instance.new("Model")
+        holder.Name = "ToolScripts_CloneTool"
+        holder:SetAttribute("SrcTool", tool.Name)
+        local newHandle
+        for _, src in ipairs(tool:GetChildren()) do
+            if src:IsA("BasePart") then
+                local okP, p = pcall(function() return src:Clone() end)
+                if okP and p then
+                    for _, d in ipairs(p:GetDescendants()) do
+                        if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") then
+                            pcall(function() d:Destroy() end)
+                        end
+                    end
+                    p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.Massless = false, false, false, false, true
+                    p.Parent = holder
+                    if src == handle then newHandle = p end
+                end
+            end
+        end
+        if not newHandle then holder:Destroy() return end
+        holder.PrimaryPart = newHandle
+        holder.Parent = clone
+
+        -- Explicit Welds with a stated C0, not WeldConstraints: a constraint bakes in
+        -- whatever offset happens to exist the instant it is created, and the parts
+        -- are still at the real tool's world position at that moment.
+        for _, p in ipairs(holder:GetChildren()) do
+            if p:IsA("BasePart") and p ~= newHandle then
+                local src = tool:FindFirstChild(p.Name)
+                local rel = (src and src:IsA("BasePart")) and handle.CFrame:ToObjectSpace(src.CFrame) or CFrame.new()
+                local w = Instance.new("Weld")
+                w.Part0, w.Part1, w.C0 = newHandle, p, rel
+                w.Parent = newHandle
+            end
+        end
+        -- The engine's own RightGrip weld already holds the exact hand offset for
+        -- this tool, so copy it rather than guessing a grip CFrame.
+        local grip = realChar:FindFirstChild("RightGrip", true)
+        local att = hand:FindFirstChild("RightGripAttachment")
+        local w = Instance.new("Weld")
+        w.Part0, w.Part1 = hand, newHandle
+        w.C0 = (grip and grip.C0) or (att and att.CFrame) or CFrame.new(0, -1, 0)
+        w.C1 = (grip and grip.C1) or tool.Grip
+        w.Parent = hand
+        toolMirror = holder
+    end
+
+    local function build()
+        local realChar = LocalPlayer.Character
+        local realRoot = realChar and realChar:FindFirstChild("HumanoidRootPart")
+        local realHumSrc = realChar and realChar:FindFirstChildOfClass("Humanoid")
+        if not (realChar and realRoot and realHumSrc) then return false end
+
+        local animIds = getAnimIds(realChar)
+        local walkSpeed = math.clamp(realHumSrc.WalkSpeed > 0 and realHumSrc.WalkSpeed or 16, 8, 30)
+
+        realChar.Archivable = true
+        local ok, c = pcall(function() return realChar:Clone() end)
+        if not ok or not c then return false end
+
+        -- Strip ALL scripts (Animate won't run in workspace anyway) and any weapon —
+        -- the clone is a cosmetic body: no knife/gun, no remotes.
+        for _, d in ipairs(c:GetDescendants()) do
+            if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript")
+                or d:IsA("Tool") or d.Name == "Knife" or d.Name == "Gun" then
+                pcall(function() d:Destroy() end)
+            end
+        end
+        local hum = c:FindFirstChildOfClass("Humanoid")
+        local root = c:FindFirstChild("HumanoidRootPart")
+        if not (hum and root) then pcall(function() c:Destroy() end) return false end
+
+        -- A clone copies the real humanoid's LIVE state, and while the farm runs that
+        -- state is deliberately broken: FlingSafe sets AutoRotate = false, flips the
+        -- humanoid into Physics and disables FallingDown, and it zeroes CanCollide on
+        -- every body part each frame. Cloned as-is the copy could not turn to face
+        -- where you walked and fell straight through the map. Reset to a clean,
+        -- ordinary humanoid instead of trusting whatever the farm left behind.
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.Anchored = false
+                p.LocalTransparencyModifier = 0
+                if p.Name ~= "HumanoidRootPart" then
+                    p.CanCollide = true
+                    p.Massless = false
+                end
+            end
+        end
+        hum.AutoRotate = true
+        hum.PlatformStand = false
+        hum.Sit = false
+        for _, s in ipairs(Enum.HumanoidStateType:GetEnumItems()) do
+            if s ~= Enum.HumanoidStateType.None then
+                pcall(function() hum:SetStateEnabled(s, true) end)
+            end
+        end
+        pcall(function() hum.JumpPower = (realHumSrc.JumpPower > 0 and realHumSrc.JumpPower) or 50 end)
+        pcall(function() hum.JumpHeight = (realHumSrc.JumpHeight > 0 and realHumSrc.JumpHeight) or 7.2 end)
+
+        c.Name = "ToolScripts_KeepPlaying"
+        c.Parent = workspace
+        root.CFrame = CFrame.new(findSpawn(realChar, realRoot))
+        hum.WalkSpeed = walkSpeed
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        clone, cloneHum = c, hum
+        pcall(mirrorTool)
+
+        -- Manual animation controller (the cloned Animate script is dead).
+        local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+        local function mk(id, looped, priority)
+            if not id or id == "" then return nil end
+            local a = Instance.new("Animation")
+            a.AnimationId = id
+            local okA, tr = pcall(function() return animator:LoadAnimation(a) end)
+            if not (okA and tr) then return nil end
+            tr.Looped = looped and true or false
+            if priority then pcall(function() tr.Priority = priority end) end
+            return tr
+        end
+        local PRI = Enum.AnimationPriority
+        local trIdle  = mk(animIds.idle, true, PRI.Core)
+        local trWalk  = mk(animIds.walk, true, PRI.Core)
+        local trRun   = mk(animIds.run, true, PRI.Core)
+        local trJump  = mk(animIds.jump, false, PRI.Movement)
+        local trFall  = mk(animIds.fall, true, PRI.Movement)
+        local trClimb = mk(animIds.climb, true, PRI.Movement)
+        -- Tool pose rides its own track alongside the locomotion one, exactly like
+        -- the default Animate script does, so it must not fight for the same slot.
+        local trTool  = mk(animIds.toolnone, true, PRI.Idle)
+        if not trWalk then trWalk = trRun end
+        if not trRun then trRun = trWalk end
+        local curTrack, lastMirror = nil, 0
+
+        -- Mark the REAL farming body so you can see where it is (glows through walls).
+        realHighlight = Instance.new("Highlight")
+        realHighlight.FillColor = LOGO.Cyan
+        realHighlight.OutlineColor = LOGO.Blue
+        realHighlight.FillTransparency = 0.45
+        realHighlight.OutlineTransparency = 0
+        realHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        realHighlight.Adornee = realChar
+        realHighlight.Parent = realChar
+        local head = realChar:FindFirstChild("Head") or realRoot
+        realTag = Instance.new("BillboardGui")
+        realTag.Name = "ToolScripts_FarmTag"
+        realTag.Adornee = head
+        realTag.Size = UDim2.fromOffset(120, 22)
+        realTag.StudsOffset = Vector3.new(0, 2.6, 0)
+        realTag.AlwaysOnTop = true
+        realTag.Parent = realChar
+        local tl = Instance.new("TextLabel")
+        tl.BackgroundTransparency = 1
+        tl.Size = UDim2.fromScale(1, 1)
+        tl.Text = "Yourself"
+        tl.TextColor3 = LOGO.Cyan
+        tl.TextStrokeColor3 = Color3.new(0, 0, 0)
+        tl.TextStrokeTransparency = 0.3
+        tl.TextScaled = true
+        tl.Parent = realTag
+
+        local cam = workspace.CurrentCamera
+        if cam then
+            savedSubject = cam.CameraSubject
+            cam.CameraSubject = hum
+        end
+
+        -- Drive the clone with YOUR input + run the animation each frame.
+        driveConn = RunService.RenderStepped:Connect(function()
+            if not Farm.keepPlaying or not clone or not clone.Parent then return end
+            local realHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if not realHum then return end
+
+            -- Move. ControlModule first (works on touch, gamepad and keyboard, and
+            -- keeps reporting while the farm has the real body in a Physics state),
+            -- then the real humanoid, then a raw WASD read as the last resort.
+            local cam2 = workspace.CurrentCamera
+            local dir = Vector3.zero
+            if getMoveVector and cam2 then
+                local okMV, mv = pcall(getMoveVector)
+                if okMV and typeof(mv) == "Vector3" and mv.Magnitude > 0.05 then
+                    local world = cam2.CFrame:VectorToWorldSpace(mv)
+                    world = Vector3.new(world.X, 0, world.Z)
+                    if world.Magnitude > 0 then dir = world.Unit end
+                end
+            end
+            if dir.Magnitude < 0.05 then
+                local rd = realHum.MoveDirection
+                if rd.Magnitude > 0.05 then dir = rd end
+            end
+            if dir.Magnitude < 0.05 and not UserInputService.TouchEnabled and cam2 then
+                local move = Vector3.zero
+                if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cam2.CFrame.LookVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cam2.CFrame.LookVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= cam2.CFrame.RightVector end
+                if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cam2.CFrame.RightVector end
+                move = Vector3.new(move.X, 0, move.Z)
+                if move.Magnitude > 0 then dir = move.Unit end
+            end
+            cloneHum:Move(dir, false)
+            if realHum.Jump or (not UserInputService.TouchEnabled and UserInputService:IsKeyDown(Enum.KeyCode.Space)) then
+                cloneHum.Jump = true
+            end
+
+            -- Keep the cosmetic weapon in step with whatever the farming body holds
+            -- (role hand-out, weapon swap, respawn). Cheap: it early-outs unless the
+            -- tool name actually changed.
+            if os.clock() - lastMirror > 0.25 then
+                lastMirror = os.clock()
+                pcall(mirrorTool)
+            end
+
+            -- Animate from the clone's own state and its REAL horizontal speed. The
+            -- old version keyed the walk track off Humanoid.WalkSpeed, a constant, so
+            -- the legs cycled at a fixed rate regardless of how fast the body moved
+            -- and the feet slid over the ground.
+            local vel = root.AssemblyLinearVelocity
+            local hSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+            local st = cloneHum:GetState()
+            local want
+            if st == Enum.HumanoidStateType.Climbing then
+                want = trClimb or trWalk
+            elseif st == Enum.HumanoidStateType.Jumping then
+                want = trJump or trFall or curTrack
+            elseif st == Enum.HumanoidStateType.Freefall then
+                want = trFall or trJump or curTrack
+            elseif hSpeed > 0.6 then
+                want = (hSpeed > 12 and trRun) or trWalk
+            else
+                want = trIdle
+            end
+            if want ~= curTrack then
+                if curTrack then pcall(function() curTrack:Stop(0.12) end) end
+                if want then pcall(function() want:Play(0.12) end) end
+                curTrack = want
+            end
+            if want and (want == trWalk or want == trRun) then
+                pcall(function() want:AdjustSpeed(math.clamp(hSpeed / 16, 0.4, 2.2)) end)
+            end
+            -- Tool pose track, played alongside the locomotion one.
+            if trTool then
+                if toolMirror and not trTool.IsPlaying then
+                    pcall(function() trTool:Play(0.15) end)
+                elseif not toolMirror and trTool.IsPlaying then
+                    pcall(function() trTool:Stop(0.15) end)
+                end
+            end
+        end)
+        return true
+    end
+
+    function Farm.setKeepPlaying(on)
+        Farm.keepPlaying = on
+        if on then
+            if not build() then
+                Farm.keepPlaying = false
+                notify("Keep Playing", "Couldn't spawn the clone (no character).", "solar:close-circle-bold", 4)
+                return false
+            end
+            notify("Keep Playing", "Walk the clone — the glowing body is you farming.", "solar:gamepad-bold", 4)
+        else
+            cleanup()
+        end
+        return true
+    end
+
+    -- Rebuild the clone if the real character respawns while active.
+    LocalPlayer.CharacterAdded:Connect(function()
+        if Farm.keepPlaying then
+            task.wait(0.6)
+            cleanup()
+            build()
+        end
+    end)
+end
+
+-- ---- Camera "noclip": see through the floor while autofarming ---------------
+-- When Tween [Safe] farms UNDER the map the camera ends up inside the floor and
+-- you just see solid dark. Fade out whatever map part the camera is currently
+-- inside (LocalTransparencyModifier, client-only) so you can see out. Runs only
+-- while farming AND not Keep-Playing (there the camera is on the clone, above map).
+do
+    local affected = {}   -- part -> true (we lowered its transparency)
+    local function restoreAll()
+        for p in pairs(affected) do
+            if p.Parent then pcall(function() p.LocalTransparencyModifier = 0 end) end
+            affected[p] = nil
+        end
+    end
+    RunService.RenderStepped:Connect(function()
+        local cam = workspace.CurrentCamera
+        if not cam or not Farm.enabled or Farm.keepPlaying then
+            if next(affected) then restoreAll() end
+            return
+        end
+        local exclude = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character then exclude[#exclude + 1] = plr.Character end
+        end
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = exclude
+        local near = workspace:GetPartBoundsInRadius(cam.CFrame.Position, 2.5, params)
+        local nearSet = {}
+        for _, p in ipairs(near) do
+            if p:IsA("BasePart") and p.Transparency < 1 then
+                nearSet[p] = true
+                affected[p] = true
+                p.LocalTransparencyModifier = 0.75
+            end
+        end
+        for p in pairs(affected) do
+            if not nearSet[p] then
+                if p.Parent then pcall(function() p.LocalTransparencyModifier = 0 end) end
+                affected[p] = nil
+            end
+        end
+    end)
+end
+
 -- ============================================================================
 -- 4) UI
 -- ============================================================================
+-- Animated border ramp. The gradient SPINS, so the first and last stop must be the
+-- same colour: the old Deep -> Blue -> Cyan ramp put a hard seam on screen every
+-- turn where 1.0 wrapped back to 0.0. Blue in both halves keeps the crossing clean.
+local BORDER_GRADIENT = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,    LOGO.Deep),
+    ColorSequenceKeypoint.new(0.25, LOGO.Blue),
+    ColorSequenceKeypoint.new(0.5,  LOGO.Cyan),
+    ColorSequenceKeypoint.new(0.75, LOGO.Blue),
+    ColorSequenceKeypoint.new(1,    LOGO.Deep),
+})
+local BORDER_THICKNESS = 3
+
 local windowCfg = {
     Title = "Tool Scripts · Autofarm",
     Icon = "solar:bolt-bold",
@@ -693,13 +1109,103 @@ local windowCfg = {
     Theme = LOGO_THEME,
     SideBarWidth = 150,
     ToggleKey = Enum.KeyCode.RightShift,
-    BorderGradient = ColorSequence.new({          -- logo blue -> cyan animated border
-        ColorSequenceKeypoint.new(0, LOGO.Deep),
-        ColorSequenceKeypoint.new(0.5, LOGO.Blue),
-        ColorSequenceKeypoint.new(1, LOGO.Cyan),
-    }),
+    BorderGradient = BORDER_GRADIENT,
+    BorderThickness = BORDER_THICKNESS,
 }
 local Window = WindUI:CreateWindow(windowCfg)
+
+-- ---- ONE animated border, on the window's own edge (same fix as the spawner) --
+-- The fork's ForkBorderStroke sits on UIElements.Main, which spans the exact window
+-- bounds, so it is the only ring that should be visible; WindUI's native stroke and
+-- the outer shadow stroke draw a SECOND ring right next to it. The fork also spins
+-- the gradient it created at +2 deg per RenderStepped, so a second rotation driver
+-- on the same object makes the colours strobe - swapping in our own gradient
+-- retires the fork's loop (it runs `while gradient.Parent`) and leaves one writer.
+local borderGrad
+local function windowRoot()
+    local main = Window and Window.UIElements and Window.UIElements.Main
+    if not main then return nil end
+    local n = main
+    while n and n.Parent and n.Name ~= "Window" do n = n.Parent end
+    return (n and n.Name == "Window") and n or nil
+end
+local function refreshWindowBorder()
+    local main = Window and Window.UIElements and Window.UIElements.Main
+    if not main then return end
+
+    local stroke = main:FindFirstChild("ForkBorderStroke")
+    if not stroke then
+        -- Fork wrapper missing (upstream WindUI fallback): build the same stroke by
+        -- hand, on Main itself so it hugs the window edge.
+        stroke = Instance.new("UIStroke")
+        stroke.Name = "ForkBorderStroke"
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        stroke.LineJoinMode = Enum.LineJoinMode.Round
+        stroke.Parent = main
+    end
+    stroke.Transparency = 0
+    stroke.Thickness = BORDER_THICKNESS
+    stroke.Color = Color3.new(1, 1, 1)   -- white base: the gradient tints it
+
+    local grad = stroke:FindFirstChild("AFBorderGrad")
+    if not grad then
+        for _, old in ipairs(stroke:GetChildren()) do
+            if old:IsA("UIGradient") then old:Destroy() end
+        end
+        grad = Instance.new("UIGradient")
+        grad.Name = "AFBorderGrad"
+        grad.Parent = stroke
+    end
+    grad.Color = BORDER_GRADIENT
+    borderGrad = grad
+    pcall(function() Window:SetBorderGradient(BORDER_GRADIENT) end)
+    pcall(function() Window:SetBorderThickness(BORDER_THICKNESS) end)
+
+    local root = windowRoot()
+    if not root then return end
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("UIStroke") and d ~= stroke then
+            local g = d:FindFirstChildOfClass("UIGradient")
+            if g then
+                g.Color = BORDER_GRADIENT                    -- minimized pill etc.
+            elseif d.Parent == main or not d:IsDescendantOf(main) then
+                pcall(function() d.Transparency = 1 end)     -- second ring at the edge
+            end
+        end
+    end
+    for _, d in ipairs(root:GetChildren()) do
+        if d ~= main and d:IsA("GuiObject") and d.Name:lower():find("shadow") then
+            pcall(function() d.Visible = false end)
+        end
+    end
+end
+-- The fork builds its chrome asynchronously, so retry instead of running once.
+task.defer(refreshWindowBorder)
+task.delay(0.25, refreshWindowBorder)
+task.delay(0.75, refreshWindowBorder)
+task.delay(1.5, refreshWindowBorder)
+
+-- Single slow driver: 18 deg/s = one turn every 20s, same pace as the spawner.
+task.spawn(function()
+    while Window and not Window.Destroyed do
+        if borderGrad then
+            local r = (os.clock() * 18) % 360
+            pcall(function() borderGrad.Rotation = r end)
+        end
+        task.wait(1 / 30)
+    end
+end)
+
+-- The border lives on Main, which stays visible when the window is minimized -
+-- without this it lingers on screen as an empty rectangle.
+pcall(function()
+    local main = Window.UIElements and Window.UIElements.Main
+    local inner = main and main:FindFirstChild("Main")
+    if not inner then return end
+    inner:GetPropertyChangedSignal("Visible"):Connect(function()
+        main.Visible = inner.Visible
+    end)
+end)
 
 pcall(function()
     Window:EditOpenButton({
@@ -811,6 +1317,14 @@ Tab:Toggle({
     Icon = "solar:eye-bold",
     Default = false,
     Callback = function(v) Farm.espEnabled = v end,
+})
+
+Tab:Toggle({
+    Title = "Keep Playing while autofarm",
+    Desc = "Spawn a client-side clone you walk around while the real you farms",
+    Icon = "solar:gamepad-bold",
+    Default = false,
+    Callback = function(v) Farm.setKeepPlaying(v) end,
 })
 
 -- ---- When bag is full ------------------------------------------------------
