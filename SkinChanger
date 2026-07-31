@@ -1,0 +1,825 @@
+--[[
+    Player Skin Swap
+    ----------------
+    Type another player's name (or UserId), load their avatar photo, press
+    "Load Avatar", and your own character copies their full appearance:
+    body colors, packages, clothing, accessories AND their animation package
+    (idle / walk / run / jump / climb / fall / swim).
+
+    Purely client-side and cosmetic. Nothing is sent to the server, so other
+    players still see your real avatar - this is only what YOU see on your
+    screen.
+
+    Humanoid:ApplyDescription() is backend-only and errors on a client, so the
+    look is rebuilt by hand: body parts swapped MeshPart-by-MeshPart (MeshId is
+    read-only, so parts are replaced and their joints re-pointed), clothing /
+    face / accessories pulled with game:GetObjects(), and the animation pack
+    transplanted into the Animate LocalScript.
+--]]
+
+pcall(function() if setthreadidentity then setthreadidentity(8) end end)
+
+-- re-runnable: tear down any previous instance
+if _G.__SkinSwap and _G.__SkinSwap.destroy then pcall(_G.__SkinSwap.destroy) end
+local SELF = { conns = {} }
+_G.__SkinSwap = SELF
+
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
+local ContentProvider = game:GetService("ContentProvider")
+local LocalPlayer     = Players.LocalPlayer
+
+-------------------------------------------------------------------------------
+-- Core: resolve a name/UserId -> UserId, fetch description, apply it locally
+--
+-- Humanoid:ApplyDescription() is backend-only, so it cannot be used from a
+-- client. Everything it does is reproduced by hand below: body parts are
+-- swapped MeshPart-by-MeshPart, clothing/face/accessories are pulled with
+-- game:GetObjects(), and the animation pack is written into the Animate
+-- LocalScript. Fetching the description itself IS allowed on the client.
+-------------------------------------------------------------------------------
+local originalDesc     -- your real avatar, cached so "Restore" works
+local originalAnimate  -- copy of the untouched Animate script (default anims)
+
+local function currentHumanoid()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+-- Cache your real look ONCE, the first time we touch it.
+local function cacheOriginal()
+    if originalDesc then return end
+    local hum = currentHumanoid()
+    if not hum then return end
+    local ok, desc = pcall(function() return hum:GetAppliedDescription() end)
+    if ok and desc then originalDesc = desc end
+    local an = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Animate")
+    if an and not originalAnimate then originalAnimate = an:Clone() end
+end
+
+-- Asset cache.
+--
+-- game:GetObjects() hands back the object before its mesh/texture content has
+-- actually streamed in, and an unloaded MeshPart renders as a plain grey block.
+-- That is why the first "Load Avatar" used to come out wrong and only the
+-- second press looked right: by then the content was in Roblox's cache.
+--
+-- So every asset is fetched once, PreloadAsync'd (which blocks until the mesh
+-- and texture really are resident), kept nil-parented as a master copy, and
+-- handed out as clones. Cloning resident content is instant, so a re-apply -
+-- or an apply that was prefetched during Preview - costs nothing.
+local assetCache = {}   -- [assetId] = Instance master copy, or false if it failed
+
+local function loadAsset(id)
+    if not id or id == 0 then return nil end
+    local master = assetCache[id]
+    if master == nil then
+        -- %d, not concatenation: modern asset ids are big enough to render in
+        -- scientific notation, which would build a broken rbxassetid:// url
+        local url = "rbxassetid://" .. string.format("%d", id)
+        local ok, objs = pcall(function() return game:GetObjects(url) end)
+        master = (ok and objs and objs[1]) or false
+        if master then
+            pcall(function() ContentProvider:PreloadAsync({master}) end)
+        end
+        assetCache[id] = master
+    end
+    if not master then return nil end
+    return master:Clone()
+end
+
+-- A body-part asset holds its MeshParts under R15ArtistIntent (or R15).
+local function packageParts(root)
+    local src = root:FindFirstChild("R15ArtistIntent") or root:FindFirstChild("R15") or root
+    local t = {}
+    for _, c in ipairs(src:GetChildren()) do
+        if c:IsA("MeshPart") then table.insert(t, c) end
+    end
+    return t
+end
+
+-- Build a throwaway reference character straight from a description, on the
+-- client. Unlike game:GetObjects(packageId), this produces default *blocky*
+-- bodies too (their body-part package id is 0, so the old path loaded nothing
+-- and left blocky avatars wearing your body). Every body part comes out named
+-- for the rig, so swapPart drops each one onto your character by name.
+--
+-- Cached and preloaded per (description, rig) for the same reason as loadAsset:
+-- a freshly built model's meshes are still streaming, so swapping it in raw
+-- gives you grey blocks on the first try. Weak keys let old descriptions go.
+local rigCache = setmetatable({}, { __mode = "k" })
+
+local function buildRefModel(desc, rigType)
+    local byRig = rigCache[desc]
+    if not byRig then
+        byRig = {}
+        rigCache[desc] = byRig
+    end
+
+    local master = byRig[rigType]
+    if master == nil then
+        local ok, model = pcall(function()
+            return Players:CreateHumanoidModelFromDescription(desc, rigType)
+        end)
+        master = (ok and model) or false
+        if master then
+            pcall(function() ContentProvider:PreloadAsync({master}) end)
+        end
+        byRig[rigType] = master
+    end
+    if not master then return nil end
+    return master:Clone()
+end
+
+-- MeshPart.MeshId is read-only at runtime, so the part is replaced outright and
+-- every joint that pointed at the old one is re-pointed at the new one.
+local function swapPart(char, newPart)
+    local old = char:FindFirstChild(newPart.Name)
+    if not (old and old:IsA("BasePart")) then return false end
+    newPart.CFrame = old.CFrame
+    newPart.Color  = old.Color
+    newPart.Parent = char
+    for _, c in ipairs(old:GetChildren()) do
+        if c:IsA("Motor6D") or c:IsA("Weld") or c:IsA("WeldConstraint") or c:IsA("Attachment") then
+            if not newPart:FindFirstChild(c.Name) then c.Parent = newPart end
+        end
+    end
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") or d:IsA("Weld") or d:IsA("WeldConstraint") then
+            if d.Part0 == old then d.Part0 = newPart end
+            if d.Part1 == old then d.Part1 = newPart end
+        end
+    end
+    old:Destroy()
+    return true
+end
+
+local ACC_TAG = "SkinSwapAcc_"
+
+-- Humanoid:AddAccessory() looks like it works, but the server owns the
+-- character's accessory list and strips client-added Accessory objects about
+-- two seconds later. A plain BasePart parented into the same character is left
+-- alone, so the Handle is pulled out of the Accessory and welded on by hand.
+local function attachAccessory(char, accessory, tag)
+    local handle = accessory:FindFirstChild("Handle")
+    if not handle then return false end
+
+    local att
+    for _, c in ipairs(handle:GetChildren()) do
+        if c:IsA("Attachment") then att = c break end
+    end
+    if not att then return false end
+
+    local target
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Attachment") and d.Name == att.Name and d.Parent ~= handle then
+            target = d
+            break
+        end
+    end
+    if not (target and target.Parent) then return false end
+
+    handle.Name        = tag
+    handle.CanCollide  = false
+    handle.CanQuery    = false
+    handle.CanTouch    = false
+    handle.Massless    = true
+    handle.CFrame      = target.WorldCFrame * att.CFrame:Inverse()
+
+    local weld = Instance.new("Weld")
+    weld.Part0  = target.Parent
+    weld.Part1  = handle
+    weld.C0     = target.CFrame
+    weld.C1     = att.CFrame
+    weld.Parent = handle
+
+    handle.Parent = char
+    accessory:Destroy()
+    return true
+end
+
+local function clearMyAccessories(char)
+    for _, c in ipairs(char:GetChildren()) do
+        if c.Name:sub(1, #ACC_TAG) == ACC_TAG then c:Destroy() end
+    end
+end
+
+-- An animation-pack asset is NOT a playable animation: it is a "R15Anim" folder
+-- whose StringValue children (idle, run, walk, pose...) hold the real Animation
+-- objects. Writing the pack id straight into Animate yields
+-- "AnimationClip loaded is not valid" - the StringValues must be transplanted.
+local ANIM_FIELDS = {
+    "ClimbAnimation", "FallAnimation", "IdleAnimation", "JumpAnimation",
+    "RunAnimation", "SwimAnimation", "WalkAnimation",
+}
+
+local function applyAnimationPack(animate, desc)
+    local applied = false
+    for _, field in ipairs(ANIM_FIELDS) do
+        local root = loadAsset(desc[field])
+        if root then
+            for _, sv in ipairs(root:GetChildren()) do
+                if sv:IsA("StringValue") then
+                    local old = animate:FindFirstChild(sv.Name)
+                    if old then old:Destroy() end
+                    sv.Parent = animate
+                    applied = true
+                end
+            end
+        end
+    end
+    return applied
+end
+
+-- The whole ApplyDescription replacement.
+local function applyDescLocal(desc)
+    local char = LocalPlayer.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false, "No character yet - respawn and retry." end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local wasAnchored = hrp and hrp.Anchored
+    if hrp then hrp.Anchored = true end
+
+    -- our own welded accessories first: their weld dies with the part it hangs
+    -- off, so leaving them would drop loose handles during the body swap
+    clearMyAccessories(char)
+
+    -- body parts. Build a reference character from the description and swap its
+    -- parts in. This covers blocky / default bodies (package id 0) as well as
+    -- mesh packages - the old game:GetObjects(package) path only handled mesh
+    -- packages, so blocky avatars left your body untouched. Match the reference
+    -- to YOUR rig so part names line up (we can't flip R6<->R15 client-side).
+    local myRig = (hum.RigType == Enum.HumanoidRigType.R6)
+        and Enum.HumanoidRigType.R6 or Enum.HumanoidRigType.R15
+    local ref = buildRefModel(desc, myRig)
+    if ref then
+        for _, part in ipairs(ref:GetChildren()) do
+            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                pcall(swapPart, char, part)
+            end
+        end
+        pcall(function() ref:Destroy() end)
+    else
+        -- fallback: mesh packages only (no blocky support)
+        for _, field in ipairs({"Head", "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg"}) do
+            local root = loadAsset(desc[field])
+            if root then
+                for _, mp in ipairs(packageParts(root)) do
+                    pcall(swapPart, char, mp)
+                end
+            end
+        end
+    end
+    pcall(function() hum:BuildRigFromAttachments() end)
+    if hrp then hrp.Anchored = wasAnchored end
+
+    -- clothing
+    for _, cls in ipairs({"Shirt", "Pants", "ShirtGraphic"}) do
+        local ex = char:FindFirstChildOfClass(cls)
+        if ex then ex:Destroy() end
+    end
+    for _, id in ipairs({desc.Shirt, desc.Pants, desc.GraphicTShirt}) do
+        local item = loadAsset(id)
+        if item then item.Parent = char end
+    end
+
+    -- face
+    local head = char:FindFirstChild("Head")
+    if head then
+        local newFace = loadAsset(desc.Face)
+        if newFace and newFace:IsA("Decal") then
+            local oldFace = head:FindFirstChild("face") or head:FindFirstChildOfClass("Decal")
+            if oldFace then oldFace:Destroy() end
+            newFace.Name = "face"
+            newFace.Parent = head
+        end
+    end
+
+    -- body colors
+    local bc = char:FindFirstChildOfClass("BodyColors")
+    if bc then
+        bc.HeadColor3     = desc.HeadColor
+        bc.TorsoColor3    = desc.TorsoColor
+        bc.LeftArmColor3  = desc.LeftArmColor
+        bc.RightArmColor3 = desc.RightArmColor
+        bc.LeftLegColor3  = desc.LeftLegColor
+        bc.RightLegColor3 = desc.RightLegColor
+    end
+
+    -- accessories: drop the real ones (destroying those sticks), drop any we
+    -- added on a previous swap, then weld the target's on as plain parts.
+    for _, a in ipairs(hum:GetAccessories()) do a:Destroy() end
+    clearMyAccessories(char)
+    local okAcc, accs = pcall(function() return desc:GetAccessories(true) end)
+    if okAcc and accs then
+        for i, info in ipairs(accs) do
+            local a = loadAsset(info.AssetId)
+            if a and a:IsA("Accessory") then
+                pcall(attachAccessory, char, a, ACC_TAG .. i)
+            end
+        end
+    end
+
+    -- animation pack. Reset to the default set first, so a pack that only
+    -- overrides some moves (run but not swim) leaves the rest stock, and so
+    -- Restore actually gives your default animations back.
+    local animate = char:FindFirstChild("Animate")
+    if animate then
+        if originalAnimate then
+            for _, sv in ipairs(originalAnimate:GetChildren()) do
+                if sv:IsA("StringValue") then
+                    local ex = animate:FindFirstChild(sv.Name)
+                    if ex then ex:Destroy() end
+                    sv:Clone().Parent = animate
+                end
+            end
+        end
+        applyAnimationPack(animate, desc)
+        -- Restarting Animate does NOT stop the tracks it already started, so the
+        -- old idle keeps playing underneath the new one and the character reads
+        -- as half-animated. Kill every track while the script is down.
+        -- One frame each way is enough for Animate to actually go down and come
+        -- back up; a fixed 0.1s/0.05s sleep just made every swap feel laggy.
+        animate.Disabled = true
+        RunService.Heartbeat:Wait()
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                pcall(function() track:Stop(0) end)
+            end
+        end
+        RunService.Heartbeat:Wait()
+        animate.Disabled = false
+    end
+
+    -- scales
+    local scales = {
+        BodyHeightScale = desc.HeightScale, BodyWidthScale = desc.WidthScale,
+        BodyDepthScale = desc.DepthScale,   HeadScale = desc.HeadScale,
+        BodyProportionScale = desc.ProportionScale, BodyTypeScale = desc.BodyTypeScale,
+    }
+    for name, v in pairs(scales) do
+        local o = hum:FindFirstChild(name)
+        if o and v then o.Value = v end
+    end
+
+    return true
+end
+
+-- Accepts "123456" (UserId) or a username. Returns userId, displayName.
+local function resolveUser(text)
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return nil, "Type a player name or UserId." end
+
+    -- pure number -> treat as UserId
+    if text:match("^%d+$") then
+        local id = tonumber(text)
+        local ok, name = pcall(function()
+            return Players:GetNameFromUserIdAsync(id)
+        end)
+        return id, ok and name or ("User " .. id)
+    end
+
+    -- try an in-server player first (exact or partial), avoids a web call
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == text:lower() or p.DisplayName:lower() == text:lower() then
+            return p.UserId, p.DisplayName
+        end
+    end
+
+    -- fall back to the web API
+    local ok, id = pcall(function()
+        return Players:GetUserIdFromNameAsync(text)
+    end)
+    if not ok or not id then return nil, "Player not found: " .. text end
+    local ok2, name = pcall(function() return Players:GetNameFromUserIdAsync(id) end)
+    return id, ok2 and name or text
+end
+
+local function fetchHeadshot(userId)
+    local ok, img = pcall(function()
+        return Players:GetUserThumbnailAsync(userId,
+            Enum.ThumbnailType.AvatarBust, Enum.ThumbnailSize.Size150x150)
+    end)
+    if ok and img then return img end
+    return "rbxthumb://type=AvatarHeadShot&w=150&h=150&id=" .. userId
+end
+
+local descCache = {}    -- [userId] = HumanoidDescription
+
+local function getDesc(userId)
+    local cached = descCache[userId]
+    if cached then return cached end
+    local ok, desc = pcall(function()
+        return Players:GetHumanoidDescriptionFromUserId(userId)
+    end)
+    if not ok or not desc then return nil end
+    descCache[userId] = desc
+    return desc
+end
+
+local function myRigType()
+    local hum = currentHumanoid()
+    return (hum and hum.RigType == Enum.HumanoidRigType.R6)
+        and Enum.HumanoidRigType.R6 or Enum.HumanoidRigType.R15
+end
+
+-- Pull everything an apply will need into the caches, off the main flow. Called
+-- as soon as a player is previewed or a favorite is listed, so by the time the
+-- Load button is pressed the swap is pure cloning and lands in one frame.
+local prefetched = {}
+local function prefetch(userId)
+    if prefetched[userId] then return end
+    prefetched[userId] = true
+    task.spawn(function()
+        local desc = getDesc(userId)
+        if not desc then
+            prefetched[userId] = nil  -- let a later attempt retry
+            return
+        end
+        buildRefModel(desc, myRigType())
+        for _, field in ipairs(ANIM_FIELDS) do loadAsset(desc[field]) end
+        for _, id in ipairs({desc.Shirt, desc.Pants, desc.GraphicTShirt, desc.Face}) do
+            loadAsset(id)
+        end
+        local okAcc, accs = pcall(function() return desc:GetAccessories(true) end)
+        if okAcc and accs then
+            for _, info in ipairs(accs) do loadAsset(info.AssetId) end
+        end
+    end)
+end
+
+-- Rebuilding the body destroys the hand that holds a MM2 weapon Tool, so the
+-- Humanoid drops and re-grips it and the MM2 skin-spawner's overlay (welded to
+-- the Handle) is left stranded in the Backpack - the weapon looks gone. If that
+-- spawner is running, poke it to rebuild its overlays once the body settles.
+local function refreshWeaponSkins()
+    local viz = _G.__MM2Viz
+    if viz and type(viz.refreshOverlays) == "function" then
+        task.delay(0.4, function() pcall(viz.refreshOverlays) end)
+        task.delay(1.2, function() pcall(viz.refreshOverlays) end)
+    end
+end
+
+-- Apply another user's full look (appearance + animation package) to your char.
+local function applyAvatar(userId)
+    cacheOriginal()
+    local hum = currentHumanoid()
+    if not hum then return false, "No character yet - respawn and retry." end
+
+    local desc = getDesc(userId)
+    if not desc then return false, "Could not fetch that avatar." end
+
+    local okApply, res, err = pcall(applyDescLocal, desc)
+    if not okApply then return false, "Apply failed: " .. tostring(res) end
+    refreshWeaponSkins()
+    return res, err
+end
+
+local function restoreAvatar()
+    if not originalDesc then return false, "No original avatar cached yet." end
+    local ok, res, err = pcall(applyDescLocal, originalDesc)
+    if not ok then return false, tostring(res) end
+    refreshWeaponSkins()
+    return res, err
+end
+
+-------------------------------------------------------------------------------
+-- Favorites: saved avatars, written to disk so they survive a rejoin.
+--
+-- Persistence uses the executor's writefile/readfile. If this executor has no
+-- filesystem, favorites still work for the session - they just don't come back
+-- next time, so every disk call is optional and pcall'd.
+-------------------------------------------------------------------------------
+local HttpService = game:GetService("HttpService")
+local FAV_DIR  = "SkinSwap"
+local FAV_FILE = FAV_DIR .. "/favorites.json"
+
+local favorites = {}    -- array of {id = userId, name = displayName}
+
+local function canPersist()
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function saveFavorites()
+    if not canPersist() then return end
+    pcall(function()
+        if type(makefolder) == "function" and type(isfolder) == "function"
+            and not isfolder(FAV_DIR) then
+            makefolder(FAV_DIR)
+        end
+        writefile(FAV_FILE, HttpService:JSONEncode(favorites))
+    end)
+end
+
+local function loadFavorites()
+    if not canPersist() then return end
+    pcall(function()
+        if type(isfile) == "function" and not isfile(FAV_FILE) then return end
+        local data = HttpService:JSONDecode(readfile(FAV_FILE))
+        if type(data) ~= "table" then return end
+        for _, e in ipairs(data) do
+            if type(e) == "table" and tonumber(e.id) then
+                table.insert(favorites, {
+                    id   = tonumber(e.id),
+                    name = tostring(e.name or e.id),
+                })
+            end
+        end
+    end)
+end
+
+local function favIndex(userId)
+    for i, e in ipairs(favorites) do
+        if e.id == userId then return i end
+    end
+    return nil
+end
+
+local function addFavorite(userId, name)
+    if not userId then return false, "Nothing to save." end
+    if favIndex(userId) then return false, "Already saved." end
+    table.insert(favorites, { id = userId, name = name or ("User " .. userId) })
+    saveFavorites()
+    return true
+end
+
+local function removeFavorite(userId)
+    local i = favIndex(userId)
+    if not i then return false end
+    table.remove(favorites, i)
+    saveFavorites()
+    return true
+end
+
+loadFavorites()
+
+SELF.apply     = applyAvatar    -- _G.__SkinSwap.apply(userId)
+SELF.restore   = restoreAvatar
+SELF.favorites = favorites
+
+-- Re-apply the chosen avatar after respawns (death keeps the skin).
+local lastUserId
+local caConn = LocalPlayer.CharacterAdded:Connect(function(c)
+    originalDesc, originalAnimate = nil, nil -- new body = re-cache real look
+    if not lastUserId then return end
+    task.delay(1.0, function()
+        if lastUserId and LocalPlayer.Character == c then
+            pcall(applyAvatar, lastUserId)
+        end
+    end)
+end)
+table.insert(SELF.conns, caConn)
+
+-------------------------------------------------------------------------------
+-- WindUI GUI (matches the spawner's look & theme)
+-------------------------------------------------------------------------------
+local ok, WindUI = pcall(function()
+    return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+end)
+if not ok or type(WindUI) ~= "table" or type(WindUI.CreateWindow) ~= "function" then
+    warn("[SkinSwap] WindUI failed to load")
+    return
+end
+
+local UI_FONT = "rbxasset://fonts/families/FredokaOne.json"
+local function notify(t, c, icon)
+    pcall(function() WindUI:Notify({ Title = t, Content = c, Icon = icon or "solar:bolt-bold", Duration = 3 }) end)
+end
+pcall(function() WindUI:SetFont(UI_FONT) end)
+
+local Window = WindUI:CreateWindow({
+    Title = "Player Skin Swap",
+    Author = "avatar + animations",
+    Folder = "SkinSwap",
+    Size = UDim2.fromOffset(460, 360),
+    Resizable = true,
+    Theme = "Dark",
+    SideBarWidth = 130,
+    HideSearchBar = true,
+    ToggleKey = Enum.KeyCode.RightAlt,
+})
+SELF.gui = Window
+
+local Tab = Window:Tab({ Title = "Skin", Icon = "solar:user-bold" })
+
+local function boxed(tab, opts)
+    opts = opts or {}; opts.Box = true; opts.BoxBorder = true
+    if opts.Opened == nil then opts.Opened = true end
+    local okS, sec = pcall(function() return tab:Section(opts) end)
+    if okS and type(sec) == "table" and type(sec.Button) == "function" then return sec end
+    pcall(function() tab:Section({ Title = opts.Title }) end)
+    return tab
+end
+
+local gInput = boxed(Tab, { Title = "Target player", Icon = "solar:user-id-bold" })
+
+local typedName = ""
+gInput:Input({
+    Title = "Name or UserId",
+    Placeholder = "e.g. Builderman or 156",
+    Callback = function(v) typedName = v end,
+})
+
+-- Preview paragraph + injected headshot image
+local previewPara = gInput:Paragraph({ Title = "No player loaded", Desc = "Type a name and press Preview." })
+
+local function previewImgLabel()
+    local ui = previewPara and previewPara.ParagraphFrame and previewPara.ParagraphFrame.UIElements
+    local anchor = ui and (ui.Title or ui.Desc)
+    if not (anchor and typeof(anchor) == "Instance") then return nil end
+    local pf = anchor.Parent
+    while pf and not (pf:IsA("Frame") or pf:IsA("ImageButton") or pf:IsA("ImageLabel")) do pf = pf.Parent end
+    if not pf then return nil end
+    local lbl = pf:FindFirstChild("SkinSwapImg")
+    if not lbl then
+        lbl = Instance.new("ImageLabel")
+        lbl.Name = "SkinSwapImg"
+        lbl.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+        lbl.BackgroundTransparency = 0.2
+        lbl.BorderSizePixel = 0
+        lbl.AnchorPoint = Vector2.new(1, 0.5)
+        lbl.Position = UDim2.new(1, -10, 0.5, 0)
+        lbl.Size = UDim2.fromOffset(64, 64)
+        lbl.ScaleType = Enum.ScaleType.Fit
+        lbl.ZIndex = 20
+        lbl.Parent = pf
+        Instance.new("UICorner", lbl).CornerRadius = UDim.new(0, 8)
+    end
+    return lbl
+end
+
+local previewUserId, previewName
+local function doPreview()
+    local id, nameOrErr = resolveUser(typedName)
+    if not id then notify("Skin Swap", nameOrErr, "solar:close-circle-bold") return end
+    previewUserId, previewName = id, nameOrErr
+    prefetch(id)  -- warm caches while the user looks at the photo
+    local img = fetchHeadshot(id)
+    pcall(function()
+        local el = previewPara and previewPara.ParagraphFrame and previewPara.ParagraphFrame.UIElements
+        if el then
+            if el.Title then el.Title.Text = nameOrErr end
+            if el.Desc then el.Desc.Text = "UserId: " .. id .. " - ready to load." end
+        end
+    end)
+    pcall(function()
+        local lbl = previewImgLabel()
+        if lbl then lbl.Image = img; lbl.Visible = true end
+    end)
+end
+
+gInput:Button({ Title = "Preview (load photo)", Icon = "solar:gallery-bold", Callback = function()
+    task.spawn(doPreview)
+end })
+
+local gActions = boxed(Tab, { Title = "Apply", Desc = "Client-side only - copies look + animations.", Icon = "solar:magic-stick-3-bold" })
+
+gActions:Button({ Title = "Load Avatar", Icon = "solar:user-check-bold", Callback = function()
+    task.spawn(function()
+        local id = previewUserId
+        if not id then
+            id = select(1, resolveUser(typedName))
+            if not id then notify("Skin Swap", "Preview a player first.", "solar:close-circle-bold") return end
+        end
+        local ok, err = applyAvatar(id)
+        if ok then
+            lastUserId = id
+            notify("Skin Swap", "Now wearing " .. (previewName or ("User " .. id)) .. "'s avatar", "solar:check-circle-bold")
+        else
+            notify("Skin Swap", err or "Failed", "solar:close-circle-bold")
+        end
+    end)
+end })
+
+gActions:Button({ Title = "Restore my avatar", Icon = "solar:refresh-bold", Callback = function()
+    task.spawn(function()
+        lastUserId = nil
+        local ok, err = restoreAvatar()
+        if ok then notify("Skin Swap", "Restored your real avatar", "solar:check-circle-bold")
+        else notify("Skin Swap", err or "Nothing to restore", "solar:info-circle-bold") end
+    end)
+end })
+
+-------------------------------------------------------------------------------
+-- Favorites tab
+--
+-- One button per saved avatar. Clicking wears it; with "Remove mode" on, the
+-- same click deletes it instead - a dropdown would need fewer elements but
+-- WindUI's list refresh is fiddly, and rebuilding plain Buttons always works.
+-------------------------------------------------------------------------------
+local FavTab = Window:Tab({ Title = "Favorites", Icon = "solar:star-bold" })
+
+local gFavAdd = boxed(FavTab, {
+    Title = "Save",
+    Desc  = canPersist() and "Stored in SkinSwap/favorites.json - survives rejoins."
+                          or "This executor has no file access: session only.",
+    Icon  = "solar:star-bold",
+})
+
+local gFavList = boxed(FavTab, { Title = "Saved avatars", Icon = "solar:users-group-rounded-bold" })
+
+local removeMode = false
+gFavList:Toggle({
+    Title = "Remove mode",
+    Desc  = "Clicking a favorite deletes it instead of wearing it.",
+    Value = false,
+    Callback = function(v) removeMode = v end,
+})
+
+local favElements, emptyPara = {}, nil
+local rebuildFavList
+rebuildFavList = function()
+    for _, el in ipairs(favElements) do pcall(function() el:Destroy() end) end
+    table.clear(favElements)
+
+    if #favorites == 0 then
+        if not emptyPara then
+            emptyPara = gFavList:Paragraph({
+                Title = "No favorites yet",
+                Desc  = "Preview a player on the Skin tab, then press Save.",
+            })
+        end
+        return
+    end
+    if emptyPara then
+        pcall(function() emptyPara:Destroy() end)
+        emptyPara = nil
+    end
+
+    for _, entry in ipairs(favorites) do
+        local fav = entry -- captured per button
+        local el = gFavList:Button({
+            Title = fav.name,
+            Desc  = "UserId: " .. fav.id,
+            Icon  = "solar:user-bold",
+            Callback = function()
+                task.spawn(function()
+                    if removeMode then
+                        removeFavorite(fav.id)
+                        rebuildFavList()
+                        notify("Favorites", "Removed " .. fav.name, "solar:trash-bin-trash-bold")
+                        return
+                    end
+                    local okFav, err = applyAvatar(fav.id)
+                    if okFav then
+                        lastUserId = fav.id
+                        notify("Skin Swap", "Now wearing " .. fav.name .. "'s avatar", "solar:check-circle-bold")
+                    else
+                        notify("Skin Swap", err or "Failed", "solar:close-circle-bold")
+                    end
+                end)
+            end,
+        })
+        table.insert(favElements, el)
+    end
+
+    -- Warm every saved avatar in the background, staggered so a big list
+    -- doesn't fire a dozen web fetches at once. Clicking one is then instant.
+    task.spawn(function()
+        for _, fav in ipairs(favorites) do
+            prefetch(fav.id)
+            task.wait(0.5)
+        end
+    end)
+end
+
+gFavAdd:Button({
+    Title = "Save current target",
+    Icon  = "solar:star-bold",
+    Callback = function()
+        task.spawn(function()
+            local id, name = previewUserId, previewName
+            if not id then
+                id, name = resolveUser(typedName)
+                if not id then
+                    notify("Favorites", "Preview or type a player first.", "solar:close-circle-bold")
+                    return
+                end
+            end
+            local okAdd, err = addFavorite(id, name)
+            if not okAdd then
+                notify("Favorites", err, "solar:info-circle-bold")
+                return
+            end
+            rebuildFavList()
+            notify("Favorites", "Saved " .. (name or ("User " .. id)), "solar:check-circle-bold")
+        end)
+    end,
+})
+
+rebuildFavList()
+
+-------------------------------------------------------------------------------
+-- teardown
+-------------------------------------------------------------------------------
+SELF.destroy = function()
+    for _, cn in ipairs(SELF.conns) do pcall(function() cn:Disconnect() end) end
+    if SELF.gui then pcall(function() SELF.gui:Destroy() end) end
+end
+
+pcall(function() Window:SelectTab(1) end)
+pcall(function() Window:SetToTheCenter() end)
+notify("Player Skin Swap", "Loaded. Type a name, Preview, then Load Avatar.", "solar:check-circle-bold")
+print("[SkinSwap] Active.")
