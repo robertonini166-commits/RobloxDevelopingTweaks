@@ -6,11 +6,12 @@
 if not bottoken   then bottoken   = "" end
 if not webhookurl then webhookurl = "" end
 if not chanelid   then chanelid   = "" end
+if not logid      then logid      = "" end  -- defaults to webhookurl if empty
+-- Discord user IDs allowed to run "!" commands. Empty table = anyone in the
+-- channel can drive the bot (insecure — fill this in for a shared channel).
+if not ajadmins   then ajadmins   = {} end
 -- HEADLESS mode: set to true for 24/7 AFK — skips WindUI entirely (saves ~15MB RAM + 2s update loop)
 if not AJ_HEADLESS then AJ_HEADLESS = true end
--- NO-RENDER mode: black overlay + stats. ON by default. Toggle with !norender
-if getgenv()._aj_norender == nil then getgenv()._aj_norender = true end
-if not logid      then logid      = "" end  -- defaults to webhookurl if empty
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- EXECUTOR SHIMS
@@ -23,6 +24,14 @@ if not request then
           or (fluxus and fluxus.request) or (krnl and krnl.request)
           or function() return { StatusCode = 0, Body = "" } end
 end
+
+-- NO-RENDER mode: black overlay + stats. ON by default. Toggle with !norender
+-- (declared after the shims because it touches getgenv)
+if getgenv()._aj_norender == nil then getgenv()._aj_norender = true end
+
+local ADMIN_IDS = {}
+for _, id in ipairs(ajadmins) do ADMIN_IDS[tostring(id)] = true end
+local ADMIN_ENFORCED = next(ADMIN_IDS) ~= nil
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- GENERATION GUARD  (kills old tasks when script is re-executed)
@@ -73,15 +82,20 @@ end
 --   1. DeviceSelect  — Tablet/Phone chooser (mobile)
 --   2. Loading > Join > Friends > Play  — friend-server join prompt (PC + mobile)
 -- ═══════════════════════════════════════════════════════════════════════
+-- Game-owned ScreenGuis that must stay visible while we click through the
+-- load screens. Everything else in PlayerGui is injected UI and gets hidden
+-- for the duration of the click so it can't swallow the input.
+local GAME_GUIS = {
+    TradeGUI=true, TradeGUI_Phone=true, Scoreboard=true, Scoreboard_Phone=true,
+    CrossPlatform=true, GameTopbar=true, InputContext=true, Fade=true, MainGUI=true,
+    GameplayControlsUI=true, BackpackUI=true, SpawnFade=true, CameraFade=true,
+    TouchInteractButtons=true, DeviceSelect=true, InteractGUI=true, Loading=true, Join=true,
+    AJ_NoRender=true,
+}
+
 task.spawn(function()
     local UIS = game:GetService("UserInputService")
     local isMobile = UIS.TouchEnabled
-    local GAME_GUIS = {
-        TradeGUI=true, TradeGUI_Phone=true, Scoreboard=true, Scoreboard_Phone=true,
-        CrossPlatform=true, GameTopbar=true, InputContext=true, Fade=true, MainGUI=true,
-        GameplayControlsUI=true, BackpackUI=true, SpawnFade=true, CameraFade=true,
-        TouchInteractButtons=true, DeviceSelect=true, InteractGUI=true, Loading=true, Join=true,
-    }
     local VIM = game:GetService("VirtualInputManager")
 
     local function vimClick(btn)
@@ -123,6 +137,9 @@ task.spawn(function()
     local loadHandled = false
     local _startTime = tick()
     while task.wait(0.1) do
+        -- Hold the clock until the place is loaded — on a slow join the prompts
+        -- appear well after 15s and the old fixed deadline gave up too early.
+        if not game:IsLoaded() then _startTime = tick() end
         local pg = LP.PlayerGui
         if dsHandled and loadHandled then break end
         local joinGui     = pg:FindFirstChild("Join")
@@ -174,12 +191,6 @@ end)
 -- Persistent watcher: clicks the "Joining a friend?" Play button whenever it
 -- appears, regardless of when the dialog shows relative to the device-select block.
 task.spawn(function()
-    local GAME_GUIs_PW = {
-        TradeGUI=true, TradeGUI_Phone=true, Scoreboard=true, Scoreboard_Phone=true,
-        CrossPlatform=true, GameTopbar=true, InputContext=true, Fade=true, MainGUI=true,
-        GameplayControlsUI=true, BackpackUI=true, SpawnFade=true, CameraFade=true,
-        TouchInteractButtons=true, DeviceSelect=true, InteractGUI=true, Loading=true, Join=true,
-    }
     local _VIM = game:GetService("VirtualInputManager")
     local function fireBtn(btn)
         for _, sigName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
@@ -214,6 +225,7 @@ task.spawn(function()
     local _pwStart = tick()
     while alive() and tick() - _pwStart < 30 do
         task.wait(0.2)
+        if not game:IsLoaded() then _pwStart = tick() end
         pcall(function()
             local pg = LP.PlayerGui
             local joinGui = pg:FindFirstChild("Join")
@@ -227,7 +239,7 @@ task.spawn(function()
             if play.AbsoluteSize.X == 0 then return end
             local hidden = {}
             for _, gui in ipairs(pg:GetChildren()) do
-                if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIs_PW[gui.Name] then
+                if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIS[gui.Name] then
                     pcall(function() gui.Enabled = false end)
                     table.insert(hidden, gui)
                 end
@@ -293,11 +305,13 @@ if _curJobId ~= "" then visited[_curJobId] = true end
 -- HELPERS
 -- ═══════════════════════════════════════════════════════════════════════
 local function commaNum(n)
-    local s = tostring(math.floor(n or 0))
-    return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+    n = math.floor(n or 0)
+    local sign = n < 0 and "-" or ""
+    local s = tostring(math.abs(n))
+    return sign .. (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
 end
 local function elapsedStr(t)
-    local s = os.time() - (t or os.time())
+    local s = math.max(0, os.time() - (t or os.time()))
     return string.format("%dm %ds", math.floor(s/60), s%60)
 end
 local function snowflakeTs(id)
@@ -305,7 +319,69 @@ local function snowflakeTs(id)
     if not n then return 0 end
     return math.floor(n / 4194304) / 1000 + 1420070400
 end
-local function nrm(s) return (s or ""):lower():gsub("[%s%'%-]", "") end
+local function nrm(s) return ((s or ""):lower():gsub("[%s%'%-]", "")) end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- DISCORD REST WRAPPER
+-- Every Discord call goes through dreq(): it honours 429 retry_after with a
+-- shared gate (so one rate-limited call pauses all of them), retries 5xx, and
+-- never throws. Raw request() calls elsewhere ignored the status entirely,
+-- which meant a rate-limited "is this hit still live?" read as "yes".
+-- ═══════════════════════════════════════════════════════════════════════
+local _dGate = 0   -- tick() before which no Discord request may be sent
+
+local function dreq(opt, retries)
+    retries = retries or 2
+    for attempt = 0, retries do
+        local gap = _dGate - tick()
+        if gap > 0 then task.wait(gap) end
+        local ok, res = pcall(request, opt)
+        local code = (ok and res and res.StatusCode) or 0
+        if code == 429 then
+            local ra = 1
+            pcall(function()
+                local b = HttpService:JSONDecode(res.Body or "{}")
+                ra = tonumber(b.retry_after) or 1
+            end)
+            _dGate = tick() + math.min(ra, 30) + 0.1
+        elseif code >= 200 and code < 300 then
+            return res
+        elseif code >= 400 and code < 500 then
+            return res   -- 401/403/404 are permanent — don't burn retries
+        else
+            task.wait(0.4 * (attempt + 1))
+        end
+    end
+    return nil
+end
+
+local function dhdr()
+    return { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" }
+end
+
+local function dJson(opt)
+    local res = dreq(opt)
+    if not res or (res.StatusCode or 0) < 200 or res.StatusCode >= 300 or not res.Body then return nil end
+    local out
+    pcall(function() out = HttpService:JSONDecode(res.Body) end)
+    return out
+end
+
+local function dchan(path)
+    return "https://discord.com/api/v10/channels/" .. tostring(chanelid) .. (path or "")
+end
+
+-- Shared 5s cache of the channel's recent messages. isHitStillLive() used to
+-- fire one HTTP round-trip per queued hit; draining a queue of 10 stale hits
+-- was 10 sequential requests. Now it is one, reused by every caller.
+local _msgCache, _msgCacheTs = nil, 0
+local function recentMsgs(force)
+    if not force and _msgCache and (tick() - _msgCacheTs) < 5 then return _msgCache end
+    if not chanelid or chanelid == "" then return nil end
+    local t = dJson({ Url = dchan("/messages?limit=50"), Method = "GET", Headers = dhdr() })
+    if t then _msgCache, _msgCacheTs = t, tick() end
+    return _msgCache
+end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- BASELINE PERSISTENCE
@@ -340,16 +416,37 @@ pcall(function()
 end)
 
 local function isSeen(msgId)    return _seenMsgIds[tostring(msgId)] == true end
+
+local _seenDirty, _seenFlushing = false, false
+local function flushSeen()
+    local t = {}
+    for id in pairs(_seenMsgIds) do table.insert(t, id) end
+    -- Numeric sort: snowflakes are 17-19 digits, so a plain string sort put the
+    -- NEWER 19-digit IDs first and the cap below then evicted them instead of
+    -- the old ones — dedup silently forgot everything recent.
+    table.sort(t, function(a, b) return (tonumber(a) or 0) < (tonumber(b) or 0) end)
+    while #t > 500 do table.remove(t, 1) end
+    local keep = {}
+    for _, id in ipairs(t) do keep[id] = true end
+    for id in pairs(_seenMsgIds) do
+        if not keep[id] then _seenMsgIds[id] = nil end
+    end
+    pcall(writefile, JNUBS_FILE, HttpService:JSONEncode(t))
+end
+
 local function markSeen(msgId)
     msgId = tostring(msgId)
     if _seenMsgIds[msgId] then return end
     _seenMsgIds[msgId] = true
+    -- Debounced: a gateway burst used to rewrite the whole 500-entry file once
+    -- per message. Now at most once every 10s.
+    _seenDirty = true
+    if _seenFlushing then return end
+    _seenFlushing = true
     task.spawn(function()
-        local t = {}
-        for id in pairs(_seenMsgIds) do table.insert(t, id) end
-        table.sort(t)
-        while #t > 500 do table.remove(t, 1) end   -- cap to 500 IDs
-        pcall(writefile, JNUBS_FILE, HttpService:JSONEncode(t))
+        task.wait(10)
+        _seenFlushing = false
+        if _seenDirty then _seenDirty = false; pcall(flushSeen) end
     end)
 end
 
@@ -358,14 +455,11 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 local function reactOk(msgId)
     if not chanelid or chanelid == "" then return end
-    pcall(function()
-        request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid
-                      .. "/messages/" .. tostring(msgId) .. "/reactions/%E2%9C%85/@me",
-            Method  = "PUT",
-            Headers = { ["Authorization"] = bottoken },
-        })
-    end)
+    dreq({
+        Url     = dchan("/messages/" .. tostring(msgId) .. "/reactions/%E2%9C%85/@me"),
+        Method  = "PUT",
+        Headers = { ["Authorization"] = bottoken },
+    }, 1)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -377,9 +471,11 @@ task.spawn(function()
             pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
         end)
     end)
+    -- Idled above is the real mechanism; this is only a safety net for clients
+    -- where Idled never fires. 55s was needlessly chatty for a 20-minute timer.
     while alive() do
+        task.wait(240)
         pcall(function() VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()) end)
-        task.wait(55)
     end
 end)
 
@@ -390,21 +486,26 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 local MAX_HIT_AGE = 20 * 60  -- skip hits older than 20 minutes
 
+-- "almost claimed" is a LIVE state — the frontier pattern for "claimed" matches
+-- the word inside it, so every near-miss hit was being thrown away. Strip those
+-- phrases before testing.
+local LIVE_PHRASES = { "almost claimed", "not claimed", "un claimed", "unclaimed" }
+local function statusIsDead(fv)
+    for _, p in ipairs(LIVE_PHRASES) do fv = fv:gsub(p, "") end
+    if fv:find("left after") then return true end
+    return fv:find("%f[%a]claimed%f[%A]") ~= nil or fv:find("%f[%a]left%f[%A]") ~= nil
+end
+
 local function isDeadEmbed(embed)
     if not embed then return false end
-    if (embed.title or ""):lower():find("left after", 1, true) then return true end
+    local title = (embed.title or ""):lower()
+    if title:find("left after", 1, true) then return true end
     for _, f in ipairs(embed.fields or {}) do
         local fv = (f.value or ""):lower()
         -- transferer status field: value = "# Status\n<emoji> <status>"
-        -- match "claimed" (but NOT "almost claimed") or "left"
-        if fv:find("# status") or fv:find("# ") then
-            if fv:find("%f[%a]claimed%f[%A]") or fv:find("%f[%a]left%f[%A]") then return true end
-            if fv:find("left after") then return true end
-        end
-        -- legacy format: field named "Status"
-        if (f.name or ""):lower() == "status" then
-            if fv:find("left server") or fv:find("%f[%a]claimed%f[%A]") then return true end
-        end
+        local isStatusField = fv:find("# status", 1, true) ~= nil
+                              or (f.name or ""):lower() == "status"
+        if isStatusField and statusIsDead(fv) then return true end
     end
     return false
 end
@@ -427,6 +528,8 @@ local function parseHit(msg)
         placeId, jobId = msg.content:match('TeleportToPlaceInstance%((%d+),%s*"([^"]+)"')
     end
     if not placeId or not jobId or jobId == "" then return nil end
+    local placeNum = tonumber(placeId)
+    if not placeNum then return nil end   -- a nil placeId reaches TeleportToPlaceInstance and hard-fails
     if visited[jobId] then return nil end
     local ts = snowflakeTs(msgId)
     if os.time() - ts > MAX_HIT_AGE then return nil end  -- too old, skip
@@ -436,7 +539,7 @@ local function parseHit(msg)
     return {
         msgId      = msgId,
         jobId      = jobId,
-        placeId    = tonumber(placeId),
+        placeId    = placeNum,
         value      = value or 0,
         playerName = cleanName,
         rawName    = rawName,
@@ -486,30 +589,36 @@ local function patchHitStatus(hit, statusText)
     if not hit or not hit.msgId or not chanelid or chanelid == "" then return end
     if not webhookurl or webhookurl == "" then return end
     -- Fetch the current message to get the full embed (we must resend the whole thing)
-    local fetchRes
-    pcall(function()
-        fetchRes = request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages/" .. hit.msgId,
-            Method  = "GET",
-            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
-        })
-    end)
-    if not fetchRes or fetchRes.StatusCode ~= 200 or not fetchRes.Body then return end
-    local msg
-    pcall(function() msg = HttpService:JSONDecode(fetchRes.Body) end)
+    local msg = dJson({
+        Url     = dchan("/messages/" .. hit.msgId),
+        Method  = "GET",
+        Headers = dhdr(),
+    })
     if not msg or not msg.embeds or not msg.embeds[1] then return end
     local embed = msg.embeds[1]
+    -- Two transferer formats: a field literally named "Status", and the newer
+    -- one whose *value* begins with "# Status". The old code only matched the
+    -- first, so on current embeds it PATCHed the message back unchanged.
+    local patched = false
     for _, f in ipairs(embed.fields or {}) do
-        if f.name == "Status" then f.value = statusText; break end
+        local fname = (f.name or ""):lower()
+        local fval  = (f.value or ""):lower()
+        if fname == "status" then
+            f.value = statusText; patched = true; break
+        elseif fval:find("# status", 1, true) then
+            f.value = "# Status\n" .. statusText; patched = true; break
+        end
     end
-    pcall(function()
-        request({
-            Url     = webhookurl .. "/messages/" .. hit.msgId,
-            Method  = "PATCH",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body    = HttpService:JSONEncode({ embeds = { embed } }),
-        })
-    end)
+    if not patched then
+        embed.fields = embed.fields or {}
+        table.insert(embed.fields, { name = "Status", value = statusText, inline = false })
+    end
+    dreq({
+        Url     = webhookurl .. "/messages/" .. hit.msgId,
+        Method  = "PATCH",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body    = HttpService:JSONEncode({ embeds = { embed } }),
+    }, 1)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -552,18 +661,7 @@ local function detectCurrentHit()
     local myJobId = tostring(game.JobId)
     if myJobId == "" then return nil end
 
-    local res
-    pcall(function()
-        res = request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=20",
-            Method  = "GET",
-            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
-        })
-    end)
-    if not res or res.StatusCode ~= 200 or not res.Body then return nil end
-
-    local msgs
-    pcall(function() msgs = HttpService:JSONDecode(res.Body) end)
+    local msgs = recentMsgs()
     if not msgs then return nil end
 
     for _, m in ipairs(msgs) do
@@ -599,31 +697,34 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 local function isHitStillLive(hit)
     if not hit.msgId or not chanelid or chanelid == "" then return true end
-    local res
-    pcall(function()
-        res = request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages/" .. hit.msgId,
-            Method  = "GET",
-            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
-        })
-    end)
-    if not res or res.StatusCode ~= 200 or not res.Body then return true end
+    -- Try the shared 5s cache first: draining a queue of stale hits is now one
+    -- HTTP round-trip total instead of one per hit.
     local msg
-    pcall(function() msg = HttpService:JSONDecode(res.Body) end)
-    if not msg then return true end
+    local msgs = recentMsgs()
+    if msgs then
+        for _, m in ipairs(msgs) do
+            if tostring(m.id) == tostring(hit.msgId) then msg = m; break end
+        end
+    end
+    if not msg then
+        msg = dJson({ Url = dchan("/messages/" .. hit.msgId), Method = "GET", Headers = dhdr() })
+    end
+    if not msg then return true end   -- unknown: assume live rather than skip a good hit
     local embed = msg.embeds and msg.embeds[1]
     if not embed then return true end
-    if (embed.title or ""):lower():find("left after", 1, true) then return false end
-    for _, f in ipairs(embed.fields or {}) do
-        if f.name == "Status" and f.value:lower():find("left server", 1, true) then return false end
-    end
-    return true
+    return not isDeadEmbed(embed)     -- single source of truth for "dead"
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- TELEPORT
 -- ═══════════════════════════════════════════════════════════════════════
+local _tpFailConn = nil
+
 local function joinServer(hit)
+    if not hit or not hit.placeId or not hit.jobId then
+        warn("[AJ] joinServer called with an incomplete hit — ignoring")
+        return
+    end
     -- Hard guard: never teleport to the server we're already in
     if tostring(game.JobId) == hit.jobId then
         warn("[AJ] Already in " .. hit.playerName .. "'s server — skipping joinServer")
@@ -644,21 +745,24 @@ local function joinServer(hit)
     queueReexec()
 
     if logid and logid ~= "" then
-        pcall(function()
-            request({
+        task.spawn(function()
+            dreq({
                 Url     = logid,
                 Method  = "POST",
                 Headers = { ["Content-Type"] = "application/json" },
                 Body    = HttpService:JSONEncode({
                     content = "Joining **" .. hit.playerName .. "** · " .. commaNum(hit.value) .. " value"
                 })
-            })
+            }, 1)
         end)
     end
 
     getgenv()._aj_teleporting = true
 
-    -- TeleportInitFailed: retry up to 5 times before giving up
+    -- TeleportInitFailed: retry up to 5 times before giving up.
+    -- Drop the previous join's listener first — on a long session these stacked
+    -- up and every one of them fired its own retry teleport.
+    if _tpFailConn then pcall(function() _tpFailConn:Disconnect() end) end
     local _failConn
     local _failCount = 0
     local _failHit   = hit
@@ -683,6 +787,14 @@ local function joinServer(hit)
             end)
         else
             pcall(function() _failConn:Disconnect() end)
+        end
+    end)
+    _tpFailConn = _failConn
+    -- Hard ceiling: if the teleport went through, this listener is dead weight.
+    task.delay(45, function()
+        if _tpFailConn == _failConn then
+            pcall(function() _failConn:Disconnect() end)
+            _tpFailConn = nil
         end
     end)
 
@@ -714,6 +826,19 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 -- SERVER HOP  (self-contained — no external URL dependency)
 -- ═══════════════════════════════════════════════════════════════════════
+-- Is the victim in this server? The transferer's embed may carry a display name
+-- rather than a username, so check both and ignore case.
+local function victimPresent(name)
+    if not name or name == "" then return false end
+    local want = name:lower()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == want then return true end
+        local ok, dn = pcall(function() return p.DisplayName end)
+        if ok and dn and dn:lower() == want then return true end
+    end
+    return false
+end
+
 local function doServerHop()
     local placeId     = game.PlaceId
     local curJob      = tostring(game.JobId)
@@ -752,29 +877,85 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 local function sendBotMsg(content)
     if not chanelid or chanelid == "" then return end
-    pcall(function()
-        request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages",
+    task.spawn(function()
+        dreq({
+            Url     = dchan("/messages"),
             Method  = "POST",
-            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+            Headers = dhdr(),
             Body    = HttpService:JSONEncode({ content = content }),
-        })
+        }, 1)
     end)
 end
 
 local function sendBotEmbed(embed)
     if not chanelid or chanelid == "" then return end
-    pcall(function()
-        request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages",
+    task.spawn(function()
+        dreq({
+            Url     = dchan("/messages"),
             Method  = "POST",
-            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
+            Headers = dhdr(),
             Body    = HttpService:JSONEncode({ embeds = { embed } }),
-        })
+        }, 1)
     end)
 end
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- MM2VALUES SCRAPER  (shared by !inv and the background preload)
+-- ═══════════════════════════════════════════════════════════════════════
+local VALUE_PAGES = {
+    { url = "https://www.mm2values.com/?p=godly",    chroma = false },
+    { url = "https://www.mm2values.com/?p=ancient",  chroma = false },
+    { url = "https://www.mm2values.com/?p=unique",   chroma = false },
+    { url = "https://www.mm2values.com/?p=vintage",  chroma = false },
+    { url = "https://www.mm2values.com/?p=chroma",   chroma = true  },
+}
+local VALUE_TTL = 1800
+
+-- Returns the cache table {allV, chrV, ts}, scraping only if stale.
+local function getValueCache(force)
+    local c = getgenv()._aj_mmValCache
+    if not force and c and (os.time() - (c.ts or 0)) < VALUE_TTL then return c end
+
+    local allV, chrV = {}, {}
+    local done = 0
+    for _, pg in ipairs(VALUE_PAGES) do
+        task.spawn(function()
+            pcall(function()
+                local ok, res = pcall(request, { Url = pg.url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0" } })
+                if not ok or not res then return end
+                local body = res.Body or ""
+                if pg.chroma then
+                    for name, raw in body:gmatch("class='chroma%-text'>([^<]+)</div></b> Value: ([%d,]+)") do
+                        local val = tonumber((raw:gsub(",", "")))
+                        if val then chrV[nrm(name:gsub("^[Cc]hroma ", ""))] = val end
+                    end
+                else
+                    for name, raw in body:gmatch("<b>([^<]+)</b><br> Value: ([%d,]+)") do
+                        local val = tonumber((raw:gsub(",", "")))
+                        if val then allV[nrm(name)] = val end
+                    end
+                end
+            end)
+            done = done + 1
+        end)
+    end
+    local polls = 0
+    while done < #VALUE_PAGES and polls < 100 do task.wait(0.2); polls = polls + 1 end
+
+    if next(allV) then
+        getgenv()._aj_mmValCache = { allV = allV, chrV = chrV, ts = os.time() }
+    elseif not getgenv()._aj_mmValCache then
+        -- Scrape failed and we have nothing — cache empties briefly so a retry
+        -- happens on the next call instead of hammering five pages per lookup.
+        getgenv()._aj_mmValCache = { allV = {}, chrV = {}, ts = os.time() - VALUE_TTL + 60 }
+    end
+    return getgenv()._aj_mmValCache
+end
+
 local destroyNoRender, buildNoRender  -- forward-declared; defined after WindUI section
+local paused = false                  -- forward-declared: handleCommand reads it,
+                                      -- and it used to resolve to a nil global here,
+                                      -- so !status never reported the paused state.
 
 local function handleCommand(cmd, senderName, args)
     logMsg("CMD !" .. cmd .. " from " .. senderName)
@@ -839,48 +1020,7 @@ local function handleCommand(cmd, senderName, args)
     elseif cmd == "inv" then
         task.spawn(function()
             pcall(function()
-                local cache = getgenv()._aj_mmValCache
-                if not cache or (os.time() - (cache.ts or 0)) >= 1800 then
-                    local allV, chrV = {}, {}
-                    local pages = {
-                        { url = "https://www.mm2values.com/?p=godly",   chroma = false },
-                        { url = "https://www.mm2values.com/?p=ancient",  chroma = false },
-                        { url = "https://www.mm2values.com/?p=unique",   chroma = false },
-                        { url = "https://www.mm2values.com/?p=vintage",  chroma = false },
-                        { url = "https://www.mm2values.com/?p=chroma",   chroma = true  },
-                    }
-                    local total = #pages
-                    local done  = 0
-
-                    for _, pg in ipairs(pages) do
-                        task.spawn(function()
-                            pcall(function()
-                                local ok, res = pcall(request, { Url = pg.url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0" } })
-                                if not ok or not res then return end
-                                local body = res.Body or ""
-                                if pg.chroma then
-                                    for name, raw in body:gmatch("class='chroma%-text'>([^<]+)</div></b> Value: ([%d,]+)") do
-                                        local val = tonumber((raw:gsub(",", "")))
-                                        if val then chrV[nrm(name:gsub("^[Cc]hroma ", ""))] = val end
-                                    end
-                                else
-                                    for name, raw in body:gmatch("<b>([^<]+)</b><br> Value: ([%d,]+)") do
-                                        local val = tonumber((raw:gsub(",", "")))
-                                        if val then allV[nrm(name)] = val end
-                                    end
-                                end
-                            end)
-                            done = done + 1
-                        end)
-                    end
-
-                    local polls = 0
-                    while done < total and polls < 60 do task.wait(0.2); polls = polls + 1 end
-
-                    getgenv()._aj_mmValCache = { allV = allV, chrV = chrV, ts = os.time() }
-                    cache = getgenv()._aj_mmValCache
-                end
-
+                local cache = getValueCache()
                 local allV, chrV = cache.allV, cache.chrV
 
                 local inv = game:GetService("ReplicatedStorage").Remotes.Extras.GetFullInventory:InvokeServer(LP.Name)
@@ -1018,17 +1158,50 @@ local function handleCommand(cmd, senderName, args)
             buildNoRender()
             sendBotMsg("⬛ No-render mode **ON** — black screen + stats active")
         end
+    elseif cmd == "pause" then
+        paused = true
+        sendBotMsg("⏸ Paused — no new hits will be joined")
+    elseif cmd == "resume" or cmd == "unpause" then
+        paused = false
+        sendBotMsg("▶️ Resumed")
+    elseif cmd == "skip" then
+        if getgenv()._aj_currentHit then
+            getgenv()._aj_done       = true
+            getgenv()._aj_doneReason = "Skipped via command"
+            sendBotMsg("⏭️ Skipping **" .. getgenv()._aj_currentHit.playerName .. "**")
+        else
+            sendBotMsg("❌ No active hit to skip")
+        end
+    elseif cmd == "queue" then
+        if #hitQueue == 0 then
+            sendBotMsg("📋 Queue empty")
+        else
+            local lines = {}
+            for i, h in ipairs(hitQueue) do
+                if i > 10 then break end
+                table.insert(lines, string.format("%d. %-18s %s  [%s]", i, h.playerName, commaNum(h.value), h.code or "?"))
+            end
+            if #hitQueue > 10 then table.insert(lines, "... and " .. (#hitQueue - 10) .. " more") end
+            sendBotEmbed({
+                color       = 0x3498DB,
+                title       = "📋 Queue — " .. #hitQueue .. " hits",
+                description = "```\n" .. table.concat(lines, "\n") .. "\n```",
+            })
+        end
     elseif cmd == "help" then
         sendBotEmbed({
             color = 0x2ECC71,
             title = "📋 MM2 Autojoiner — Commands",
             description = table.concat({
                 "**!status** — current target, value, time in server, queue size",
+                "**!queue** — list queued hits with their join codes",
                 "**!inv** — your MM2 inventory (Godly+) with values",
                 "**!join CODE** — join a specific hit by code (shown in transferer embed as 🔑 `XXXXXX`)",
                 "**!rejoin** — teleport back to the active hit's server",
                 "**!serverhop** — leave and join a random MM2 server",
                 "**!retry** — retry the last hit that failed to join",
+                "**!skip** — abandon the current hit and move to the next",
+                "**!pause** / **!resume** — stop or restart joining new hits",
                 "**!lastclaim** — info about the last successfully claimed trade",
                 "**!norender** — toggle black-screen no-render mode (stats overlay)",
                 "**!help** — this message",
@@ -1044,17 +1217,37 @@ end
 -- Shows live stats. Toggle via !norender command or AJ_NORENDER flag.
 -- ═══════════════════════════════════════════════════════════════════════
 local _nrGui, _nrLabel, _nrConsole, _nrLoop
+local _nrSavedQuality, _nrSavedFps
+
+-- The black ScreenGui only HIDES the world — Roblox still renders every frame
+-- behind it, so on its own it saved nothing. These actually cut the work.
+local function setRendering(on)
+    pcall(function() game:GetService("RunService"):Set3dRenderingEnabled(on) end)
+    pcall(function()
+        if on then
+            settings().Rendering.QualityLevel = _nrSavedQuality or Enum.QualityLevel.Automatic
+        else
+            _nrSavedQuality = settings().Rendering.QualityLevel
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        end
+    end)
+    if setfpscap then
+        pcall(function() setfpscap(on and (_nrSavedFps or 60) or 5) end)
+    end
+end
 
 destroyNoRender = function()
     if _nrGui then pcall(function() _nrGui:Destroy() end) end
     _nrGui, _nrLabel, _nrConsole = nil, nil, nil
     if _nrLoop then _nrLoop = false end
+    if getgenv()._aj_norender then setRendering(true) end
     getgenv()._aj_norender = false
 end
 
 buildNoRender = function()
     destroyNoRender()
     getgenv()._aj_norender = true
+    setRendering(false)
 
     -- Wait for PlayerGui to be ready (important after teleport)
     local lp = Players.LocalPlayer
@@ -1146,8 +1339,11 @@ buildNoRender = function()
                 local q     = hitQueue and #hitQueue or 0
                 local up    = os.time() - startTs
                 local upStr = string.format("%dh %02dm %02ds", math.floor(up/3600), math.floor(up/60)%60, up%60)
-                local ping  = math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue())
-                local fps   = math.floor(workspace:GetRealPhysicsFPS())
+                -- Own pcall: on clients where "Data Ping" is missing this used to
+                -- throw and take the whole stats panel down with it.
+                local ping, fps = 0, 0
+                pcall(function() ping = math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue()) end)
+                pcall(function() fps  = math.floor(workspace:GetRealPhysicsFPS()) end)
                 local gwSt  = getgenv()._aj_gwSession and "GW ✓" or "REST"
 
                 _nrLabel.Text = table.concat({
@@ -1186,7 +1382,8 @@ end
 -- WINDUI  (optional — core logic works even if this fails to load)
 -- ═══════════════════════════════════════════════════════════════════════
 local WindUI, curTarget, curState, wsStatus, qSlots, statTime, statVal, statVisited, statLastTrade
-local paused   = false
+-- NOTE: `paused` is declared above handleCommand — do not redeclare it here or
+-- the UI toggle and the bot commands end up writing to two different variables.
 local MAX_SLOTS = 6
 qSlots = {}
 
@@ -1342,7 +1539,15 @@ local function processMsg(msg)
     if not msg.webhook_id and msg.content then
         local cmd, args = msg.content:match("^!(%S+)%s*(.*)")
         if cmd then
-            local sender = (msg.author and msg.author.username) or "unknown"
+            local author = msg.author or {}
+            local sender = author.username or "unknown"
+            -- Anyone who can type in the channel could previously drive the bot
+            -- (!join, !serverhop, !norender). Gate on user ID when ajadmins is set.
+            if author.bot then return end
+            if ADMIN_ENFORCED and not ADMIN_IDS[tostring(author.id)] then
+                logMsg("CMD !" .. cmd .. " from " .. sender .. " — DENIED (not in ajadmins)")
+                return
+            end
             task.spawn(function() handleCommand(cmd:lower(), sender, args or "") end)
         end
     end
@@ -1367,6 +1572,10 @@ local function processMsg(msg)
     local ch = getgenv()._aj_currentHit
     if getgenv()._aj_teleporting and ch and hit.value > ch.value then
         logMsg("Mid-teleport switch → " .. hit.playerName .. " (" .. commaNum(hit.value) .. " > " .. commaNum(ch.value) .. ")")
+        -- Put the abandoned target back in the queue instead of dropping it —
+        -- it is still a live hit, just a smaller one.
+        visited[ch.jobId] = nil
+        enqueue(ch)
         joinServer(hit)
         return
     end
@@ -1403,61 +1612,50 @@ local function startGateway()
     -- Gateway only delivers NEW messages; this catches hits posted before we connected.
     -- Also seeds knownPlayers from recent history.
     pcall(function()
-        local res = request({
-            Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=50",
-            Method  = "GET",
-            Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
-        })
-        if res and res.StatusCode == 200 and res.Body then
-            local msgs = HttpService:JSONDecode(res.Body)
-            -- oldest-first so queue is sorted properly
-            for i = #msgs, 1, -1 do
-                local m = msgs[i]
-                local embed = m.embeds and m.embeds[1]
-                local n = embed and embed.author and embed.author.name
-                if n and n ~= "" and n ~= "Unknown" then
-                    getgenv()._aj_knownPlayers[n] = true
-                end
-                if embed and not isDeadEmbed(embed) and not isSeen(tostring(m.id)) then
-                    local _ok, hit = pcall(parseHit, m)
-                    if _ok and hit then
-                        markSeen(tostring(m.id))
-                        enqueue(hit)
-                        logMsg("Startup hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
-                    end
+        local msgs = recentMsgs(true)
+        if not msgs then return end
+        -- oldest-first so queue is sorted properly
+        for i = #msgs, 1, -1 do
+            local m = msgs[i]
+            local embed = m.embeds and m.embeds[1]
+            local n = embed and embed.author and embed.author.name
+            if n and n ~= "" and n ~= "Unknown" then
+                getgenv()._aj_knownPlayers[n] = true
+            end
+            if embed and not isDeadEmbed(embed) and not isSeen(tostring(m.id)) then
+                local _ok, hit = pcall(parseHit, m)
+                if _ok and hit then
+                    markSeen(tostring(m.id))
+                    enqueue(hit)
+                    logMsg("Startup hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
                 end
             end
         end
     end)
 
-    -- ── WebSocket Gateway ──────────────────────────────────────────────
-    if not WebSocket then
-        warn("[AJ GW] WebSocket not available — falling back to REST polling (3s interval)")
-        pcall(function() wsStatus:SetDesc("REST polling (no WebSocket)") end)
-        -- REST fallback identical to old behaviour
+    -- ── REST polling fallback ──────────────────────────────────────────
+    -- Used when the executor has no WebSocket, and also when the gateway
+    -- repeatedly fails to reach READY (bad token / privileged intent not
+    -- enabled) — previously that case just reconnected forever in silence.
+    local restStarted = false
+    local function startRestPolling(why)
+        if restStarted then return end
+        restStarted = true
+        warn("[AJ GW] REST polling active — " .. why)
+        pcall(function() wsStatus:SetDesc("REST polling — " .. why) end)
+
         local lastSeenId = loadBaseline()
         if not lastSeenId then
-            pcall(function()
-                local res = request({
-                    Url     = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=1",
-                    Method  = "GET",
-                    Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" },
-                })
-                if res and res.StatusCode == 200 and res.Body then
-                    local msgs = HttpService:JSONDecode(res.Body)
-                    if msgs and msgs[1] then lastSeenId = tostring(msgs[1].id); saveBaseline(lastSeenId) end
-                end
-            end)
+            local msgs = dJson({ Url = dchan("/messages?limit=1"), Method = "GET", Headers = dhdr() })
+            if msgs and msgs[1] then lastSeenId = tostring(msgs[1].id); saveBaseline(lastSeenId) end
         end
         task.spawn(function()
             while alive() do
                 task.wait(3)
                 pcall(function()
-                    local url = "https://discord.com/api/v10/channels/" .. chanelid .. "/messages?limit=10"
+                    local url = dchan("/messages?limit=10")
                     if lastSeenId then url = url .. "&after=" .. lastSeenId end
-                    local res = request({ Url = url, Method = "GET", Headers = { ["Authorization"] = bottoken, ["Content-Type"] = "application/json" } })
-                    if not res or res.StatusCode ~= 200 then return end
-                    local msgs = HttpService:JSONDecode(res.Body)
+                    local msgs = dJson({ Url = url, Method = "GET", Headers = dhdr() })
                     if not msgs or #msgs == 0 then return end
                     for i = #msgs, 1, -1 do processMsg(msgs[i]) end
                     lastSeenId = tostring(msgs[1].id); saveBaseline(lastSeenId)
@@ -1465,10 +1663,16 @@ local function startGateway()
                 end)
             end
         end)
+    end
+
+    -- ── WebSocket Gateway ──────────────────────────────────────────────
+    if not WebSocket then
+        startRestPolling("no WebSocket in this executor")
         return
     end
 
     local gwConnId  = 0
+    local gwFails   = 0   -- consecutive connects that never reached READY/RESUMED
     local gwSocket  = nil
     local helloGenId = 0
     local readyGenId = 0
@@ -1502,6 +1706,15 @@ local function startGateway()
             return
         end
 
+        -- Heartbeat ACK bookkeeping. Without this a socket that stays open but
+        -- stops delivering (the classic silent-death of a 24/7 bot) is never
+        -- noticed: we keep sending heartbeats into the void and no hit arrives.
+        local lastBeatAt, lastAckAt = 0, tick()
+
+        local function killSocket()
+            pcall(function() if gwSocket then gwSocket:Close() end end)
+        end
+
         gwSocket.OnMessage:Connect(function(raw)
             if gwConnId ~= myId then return end
             local data
@@ -1525,14 +1738,28 @@ local function startGateway()
                         properties = { os = "linux", browser = "opsec", device = "desktop" },
                     })
                 end
+                lastAckAt = tick()
                 task.spawn(function()
+                    -- Spec: jitter the first beat so every bot doesn't beat in lockstep
+                    task.wait(interval * math.random())
                     while gwConnId == myId and alive() do
+                        if lastBeatAt > 0 and lastAckAt < lastBeatAt then
+                            warn("[AJ GW] No HEARTBEAT_ACK — zombie socket, forcing resume")
+                            pcall(function() wsStatus:SetDesc("Gateway zombie — resuming...") end)
+                            getgenv()._aj_gwResume = true
+                            killSocket()
+                            break
+                        end
+                        lastBeatAt = tick()
+                        sendGW(1, getgenv()._aj_gwSeq)
                         task.wait(interval)
                         if gwConnId ~= myId then break end
-                        sendGW(1, getgenv()._aj_gwSeq)
                     end
                 end)
             end
+
+            -- op 11: HEARTBEAT_ACK
+            if data.op == 11 then lastAckAt = tick() end
 
             -- op 0: dispatch
             if data.op == 0 then
@@ -1541,10 +1768,12 @@ local function startGateway()
                     getgenv()._aj_gwResumeUrl = data.d.resume_gateway_url
                     getgenv()._aj_gwResume    = true
                     readyGenId = myId
+                    gwFails    = 0
                     warn("[AJ GW] READY")
                     pcall(function() wsStatus:SetDesc("Gateway live ✓ " .. os.date("%H:%M:%S")) end)
                 elseif data.t == "RESUMED" then
                     readyGenId = myId
+                    gwFails    = 0
                     warn("[AJ GW] RESUMED")
                     pcall(function() wsStatus:SetDesc("Gateway resumed ✓ " .. os.date("%H:%M:%S")) end)
                 elseif data.t == "MESSAGE_CREATE" then
@@ -1558,27 +1787,39 @@ local function startGateway()
             -- op 7: server wants us to reconnect with RESUME
             if data.op == 7 then
                 getgenv()._aj_gwResume = true
-                pcall(function() if gwSocket then gwSocket:Close() end end)
+                killSocket()
             end
 
-            -- op 9: invalid session — resume if d==true, else re-identify
+            -- op 9: invalid session — resume if d==true, else re-identify.
+            -- The wait runs off-thread: yielding inside OnMessage stalls every
+            -- later frame on this socket, including MESSAGE_CREATE.
             if data.op == 9 then
                 getgenv()._aj_gwResume = (data.d == true)
                 if not getgenv()._aj_gwResume then getgenv()._aj_gwSession = nil end
-                task.wait(math.random(1, 5))
-                pcall(function() if gwSocket then gwSocket:Close() end end)
+                task.spawn(function()
+                    task.wait(math.random(1, 5))
+                    killSocket()
+                end)
             end
         end)
 
         gwSocket.OnClose:Connect(function()
             if gwConnId ~= myId then return end
             gwSocket = nil
-            warn("[AJ GW] Closed — reconnecting")
+            if readyGenId ~= myId then gwFails = gwFails + 1 end
+            if gwFails >= 5 then
+                warn("[AJ GW] 5 connects without READY — giving up on the gateway")
+                startRestPolling("gateway refused (bad token or MESSAGE_CONTENT intent off?)")
+                return
+            end
+            -- Exponential backoff so a refusing gateway isn't hammered
+            local backoff = math.min(5 * (2 ^ gwFails), 120) + math.random() * 5
+            warn("[AJ GW] Closed — reconnecting in " .. string.format("%.1f", backoff) .. "s")
             pcall(function() wsStatus:SetDesc("Gateway closed — reconnecting...") end)
             if getgenv()._aj_gwSession and getgenv()._aj_gwSeq then
                 getgenv()._aj_gwResume = true
             end
-            task.wait(5 + math.random() * 5)
+            task.wait(backoff)
             if gwConnId == myId and alive() then connectGateway() end
         end)
 
@@ -1587,7 +1828,12 @@ local function startGateway()
             task.wait(6)
             if gwConnId == myId and helloGenId ~= myId then
                 warn("[AJ GW] No HELLO (dead socket), fast retry")
-                pcall(function() if gwSocket then gwSocket:Close() end end)
+                gwFails = gwFails + 1
+                killSocket()
+                if gwFails >= 5 then
+                    startRestPolling("gateway never sends HELLO")
+                    return
+                end
                 if gwConnId == myId then gwSocket = nil; connectGateway() end
                 return
             end
@@ -1595,7 +1841,7 @@ local function startGateway()
             task.wait(8)
             if gwConnId == myId and readyGenId ~= myId then
                 warn("[AJ GW] HELLO but no READY (rate limited?), backing off")
-                pcall(function() if gwSocket then gwSocket:Close() end end)
+                killSocket()
                 task.wait(3 + math.random() * 4)
                 if gwConnId == myId then gwSocket = nil; connectGateway() end
             end
@@ -1645,8 +1891,13 @@ task.spawn(function()
         if data then lastOffer = data.LastOffer end
     end))
 
-    -- Inventory snapshot helpers for claimed-item detection
-    local function snapInventory()
+    -- Inventory snapshot helpers for claimed-item detection.
+    -- Throttled: this is a full GetFullInventory round-trip and it used to fire
+    -- on every incoming trade request, so anyone on the allow-list could stall
+    -- the client just by spamming requests.
+    local _snapCache, _snapCacheAt = nil, 0
+    local function snapInventory(useCache)
+        if useCache and _snapCache and (tick() - _snapCacheAt) < 5 then return _snapCache end
         local snap = {}
         pcall(function()
             local inv = game:GetService("ReplicatedStorage").Remotes.Extras.GetFullInventory:InvokeServer(LP.Name)
@@ -1658,6 +1909,7 @@ task.spawn(function()
                 end
             end
         end)
+        _snapCache, _snapCacheAt = snap, tick()
         return snap
     end
 
@@ -1674,7 +1926,7 @@ task.spawn(function()
                 return false
             end
             -- Snapshot inventory before trade starts so we can diff after
-            task.spawn(function() preTradeSnap = snapInventory() end)
+            task.spawn(function() preTradeSnap = snapInventory(true) end)
             getgenv()._aj_lastTradeTime = os.time()
             setAction("Trade request accepted from " .. tostring(sender))
             task.delay(0.5, function()
@@ -1684,19 +1936,35 @@ task.spawn(function()
         end
     end)
 
-    -- Backup: event path (some servers use FireClient instead of InvokeClient)
-    TradeRS.RequestSent.OnClientEvent:Connect(function(sender)
+    -- Backup: event path (some servers use FireClient instead of InvokeClient).
+    -- Tracked in `conns` — untracked, re-executing the script stacked a second
+    -- listener and every request got AcceptRequest fired twice.
+    table.insert(conns, TradeRS.RequestSent.OnClientEvent:Connect(function(sender)
         if not isAllowed(sender) then
             task.delay(0.1, function()
                 pcall(function() TradeRS.DeclineRequest:FireServer() end)
             end)
             return
         end
-        task.spawn(function() preTradeSnap = snapInventory() end)
+        task.spawn(function() preTradeSnap = snapInventory(true) end)
         getgenv()._aj_lastTradeTime = os.time()
         task.wait(0.5)
         pcall(function() TradeRS.AcceptRequest:FireServer() end)
-    end)
+    end))
+
+    -- Safety: never confirm a trade where WE are the one giving items away.
+    -- The old loop fired AcceptTrade on any StartTrade, so an allow-listed name
+    -- could open a trade, put nothing in, and take whatever we had staged.
+    local function ourSideIsEmpty(td)
+        if type(td) ~= "table" then return true end   -- unknown shape: don't block the normal path
+        local mine = td[LP.Name] or td.MyOffer or td.Offer
+        if type(mine) ~= "table" then return true end
+        for _, v in pairs(mine) do
+            if type(v) == "number" and v > 0 then return false end
+            if type(v) == "table" and next(v) ~= nil then return false end
+        end
+        return true
+    end
 
     -- Shared polling-based accept loop (mirrors transferer's ReadyTrade).
     -- Launched by StartTrade event AND by post-accept request guard — whichever triggers first.
@@ -1706,23 +1974,30 @@ task.spawn(function()
         if acceptLoopRunning then return end
         acceptLoopRunning = true
         task.spawn(function()
-            local cooldownExpiry = tick() + 3
+            local cooldownExpiry = tick() + 2
             local deadline       = tick() + 50
             while tick() < deadline and alive() do
                 local ok, status, td = pcall(function()
                     return TradeRS.GetTradeStatus:InvokeServer()
                 end)
-                if not ok then task.wait(0.5); continue end
+                if not ok then task.wait(0.3); continue end
                 if status == "None" then break end
                 if td and td.LastOffer then lastOffer = td.LastOffer end
                 if status == "StartTrade" and lastOffer ~= nil and tick() >= cooldownExpiry then
-                    pcall(function()
-                        TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
-                    end)
-                    setAction("AcceptTrade fired — waiting for server confirm")
-                    task.wait(1)
+                    if ourSideIsEmpty(td) then
+                        pcall(function()
+                            TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
+                        end)
+                        setAction("AcceptTrade fired — waiting for server confirm")
+                        task.wait(0.5)
+                    else
+                        warn("[AJ] Refusing to accept — our own offer is not empty")
+                        setAction("⛔ Trade refused: our side is not empty")
+                        pcall(function() TradeRS.DeclineTrade:FireServer() end)
+                        break
+                    end
                 end
-                task.wait(0.5)
+                task.wait(0.3)
             end
             acceptLoopRunning = false
         end)
@@ -1754,15 +2029,22 @@ task.spawn(function()
             preTradeSnap = nil
 
             local receivedItems = {}
-            local mmValCache = getgenv()._aj_mmValCache
-            local allV = (mmValCache and mmValCache.allV) or {}
+            local vc   = getValueCache()          -- scrapes only if the cache is stale
+            local allV = (vc and vc.allV) or {}
+            local chrV = (vc and vc.chrV) or {}
 
             for id, info in pairs(postSnap) do
                 local before = snap[id] and snap[id].count or 0
                 local gained = info.count - before
                 if gained > 0 then
                     local itemName = info.name
-                    local val = (allV[nrm(itemName)] or 0) * gained
+                    -- Chromas live in their own table; looking them up in allV
+                    -- returned 0 and undercounted every chroma claim.
+                    local isChroma = tostring(id):find("Chroma", 1, true) ~= nil
+                    local unit = isChroma
+                        and (chrV[nrm((itemName:gsub("^[Cc]hroma ", "")))] or 0)
+                        or  (allV[nrm(itemName)] or 0)
+                    local val = unit * gained
                     table.insert(receivedItems, { name = itemName, amount = gained, value = val })
                     logMsg("Got: " .. itemName .. " x" .. gained .. " (" .. commaNum(val) .. " value)")
                     getgenv()._aj_lastWeapon = { name = itemName, amount = gained, value = val, ts = os.time() }
@@ -1784,6 +2066,11 @@ task.spawn(function()
                 totalVal   = totalVal,
             }
             setAction("✅ Trade claimed from " .. (ch and ch.playerName or "?") .. " — +" .. commaNum(totalVal) .. " value")
+            -- Tell the transferer's embed the hit is done instead of leaving it
+            -- stuck on "🟡 Autojoining..." forever.
+            if ch then
+                task.spawn(function() patchHitStatus(ch, "✅ Claimed · +" .. commaNum(totalVal) .. " value") end)
+            end
 
             if logid and logid ~= "" then
                 local lines = {}
@@ -1791,8 +2078,8 @@ task.spawn(function()
                     table.insert(lines, it.name .. " x" .. it.amount .. "  (" .. commaNum(it.value) .. " value)")
                 end
                 local desc = #lines > 0 and table.concat(lines, "\n") or "items transferred (no diff)"
-                pcall(function()
-                    request({
+                task.spawn(function()
+                    dreq({
                         Url     = logid,
                         Method  = "POST",
                         Headers = { ["Content-Type"] = "application/json" },
@@ -1819,16 +2106,20 @@ task.spawn(function()
         preTradeSnap = nil
     end))
 
-    -- Race-condition guard: poll every 2s for missed ReceivingRequest or StartTrade
+    -- Race-condition guard: poll for a missed ReceivingRequest or StartTrade.
+    -- Adaptive interval — 1.5s while we're on a hit, 8s when idle. The old fixed
+    -- 2s meant a remote round-trip every 2s for the entire 24/7 session, and it
+    -- also raced the accept loop's own polling.
     task.spawn(function()
         task.wait(1)
         while alive() do
             if not alive() then break end
+            if acceptLoopRunning then task.wait(1); continue end
             pcall(function()
                 local status, td = TradeRS.GetTradeStatus:InvokeServer()
                 if status == "ReceivingRequest" then
                     warn("[AJ] Pending ReceivingRequest detected — accepting")
-                    task.spawn(function() preTradeSnap = snapInventory() end)
+                    task.spawn(function() preTradeSnap = snapInventory(true) end)
                     getgenv()._aj_lastTradeTime = os.time()
                     task.delay(0.3, function()
                         pcall(function() TradeRS.AcceptRequest:FireServer() end)
@@ -1846,7 +2137,7 @@ task.spawn(function()
                     end
                 end
             end)
-            task.wait(2)
+            task.wait(getgenv()._aj_currentHit and 1.5 or 8)
         end
     end)
 end)
@@ -1890,9 +2181,11 @@ task.spawn(function()
         if ch and not getgenv()._aj_done then
             local timeInServer = os.time() - (getgenv()._aj_inServerSince or os.time())
 
-            -- Condition 1: victim left (only check after 10s so server has time to populate)
-            -- ch.playerName is already the clean username (age suffix stripped in parseHit)
-            if timeInServer >= 10 and Players:FindFirstChild(ch.playerName) == nil then
+            -- Condition 1: victim left (only check after 10s so server has time to populate).
+            -- FindFirstChild matched Name only — when the transferer's embed carries
+            -- a display name instead, that never matched and every hit was declared
+            -- "victim left" 10s after landing. Match either, case-insensitively.
+            if timeInServer >= 10 and not victimPresent(ch.playerName) then
                 getgenv()._aj_done       = true
                 getgenv()._aj_doneReason = "Victim left"
                 setAction("⚠️ Victim left — moving on")
@@ -1902,7 +2195,7 @@ task.spawn(function()
             -- Reset timer while victim is in server so we don't bail mid-round.
             -- Only count down when victim is actually here and no active trade.
             local lastT = getgenv()._aj_lastTradeTime or 0
-            if Players:FindFirstChild(ch.playerName) ~= nil then
+            if victimPresent(ch.playerName) then
                 -- victim still here — keep resetting if no trade has started yet
                 if lastT == 0 then
                     getgenv()._aj_lastTradeTime = os.time()
@@ -1918,6 +2211,12 @@ task.spawn(function()
         if getgenv()._aj_done and ch then
             local reason = getgenv()._aj_doneReason
             logMsg("Done: " .. ch.playerName .. " — " .. (reason ~= "" and reason or "moving on"))
+            -- Only report a *failure* here; a successful claim already patched
+            -- the embed with its own value line.
+            if reason ~= "" and reason ~= "Skipped" and (getgenv()._aj_lastClaimTime or 0) < (getgenv()._aj_inServerSince or 0) then
+                local _ch = ch
+                task.spawn(function() patchHitStatus(_ch, "⚪ Autojoiner left · " .. reason) end)
+            end
             pcall(function()
                 WindUI:Notify({ Title = "Moving on", Desc = reason ~= "" and reason or "Done", Icon = "arrow-right", Duration = 2 })
             end)
@@ -1932,27 +2231,28 @@ task.spawn(function()
         -- Jump to the highest-value queued hit immediately.
         -- Loop through stale hits without waiting so we land on a live one fast.
         if not getgenv()._aj_currentHit and #hitQueue > 0 then
-            local next = dequeue()
-            while next do
-                if isHitStillLive(next) then
-                    logMsg("Joining: " .. next.playerName .. " · " .. commaNum(next.value) .. " value")
-                    setAction("🚀 Joining " .. next.playerName .. " (" .. commaNum(next.value) .. " value)")
+            -- `nxt`, not `next` — the old name shadowed the Lua builtin.
+            local nxt = dequeue()
+            while nxt do
+                if isHitStillLive(nxt) then
+                    logMsg("Joining: " .. nxt.playerName .. " · " .. commaNum(nxt.value) .. " value")
+                    setAction("🚀 Joining " .. nxt.playerName .. " (" .. commaNum(nxt.value) .. " value)")
                     pcall(function()
                         WindUI:Notify({
                             Title = "Joining",
-                            Desc  = next.playerName .. " · " .. commaNum(next.value) .. " value",
+                            Desc  = nxt.playerName .. " · " .. commaNum(nxt.value) .. " value",
                             Icon  = "log-in", Duration = 4,
                         })
                     end)
-                    getgenv()._aj_currentHit = next
-                    joinServer(next)
+                    getgenv()._aj_currentHit = nxt
+                    joinServer(nxt)
                     task.wait(10)
                     getgenv()._aj_teleporting = false
                     break
                 else
-                    logMsg("Skip: " .. next.playerName .. " — Left Server")
-                    getgenv()._aj_lastFailedHit = next
-                    next = dequeue()
+                    logMsg("Skip: " .. nxt.playerName .. " — Left Server")
+                    getgenv()._aj_lastFailedHit = nxt
+                    nxt = dequeue()
                 end
             end
         end
@@ -1963,58 +2263,53 @@ end)
 -- START — derive chanelid from webhookurl if not set directly
 -- ═══════════════════════════════════════════════════════════════════════
 if (chanelid == "" or not chanelid) and webhookurl and webhookurl ~= "" then
-    pcall(function()
-        local res = request({ Url = webhookurl, Method = "GET" })
-        if res and res.StatusCode == 200 and res.Body then
-            local wh = HttpService:JSONDecode(res.Body)
-            if wh and wh.channel_id then chanelid = tostring(wh.channel_id) end
-        end
-    end)
+    local wh = dJson({ Url = webhookurl, Method = "GET" })
+    if wh and wh.channel_id then chanelid = tostring(wh.channel_id) end
 end
 if not chanelid or chanelid == "" then
     warn("[MM2 Autojoiner] Could not resolve channel ID from webhook. Set chanelid manually.")
 end
 if logid == "" then logid = webhookurl end
+if not ADMIN_ENFORCED then
+    warn("[MM2 Autojoiner] ajadmins is empty — anyone in the channel can run ! commands.")
+end
 
 startGateway()
 
--- Pre-load mm2values.com cache in background so item values in trade webhooks are never 0.
+-- `visited` is keyed by jobId and never pruned; over a multi-day session it is
+-- the one table that grows without bound. Message-level dedup is file-backed,
+-- so dropping the oldest entries here is safe.
 task.spawn(function()
-    if getgenv()._aj_mmValCache and (os.time() - (getgenv()._aj_mmValCache.ts or 0)) < 1800 then return end
-    local allV, chrV = {}, {}
-    local pages = {
-        { url = "https://www.mm2values.com/?p=godly",   chroma = false },
-        { url = "https://www.mm2values.com/?p=ancient",  chroma = false },
-        { url = "https://www.mm2values.com/?p=unique",   chroma = false },
-        { url = "https://www.mm2values.com/?p=vintage",  chroma = false },
-        { url = "https://www.mm2values.com/?p=chroma",   chroma = true  },
-    }
-    local done = 0
-    for _, pg in ipairs(pages) do
-        task.spawn(function()
-            pcall(function()
-                local ok, res = pcall(request, { Url = pg.url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0" } })
-                if not ok or not res then return end
-                local body = res.Body or ""
-                if pg.chroma then
-                    for name, raw in body:gmatch("class='chroma%-text'>([^<]+)</div></b> Value: ([%d,]+)") do
-                        local val = tonumber((raw:gsub(",", "")))
-                        if val then chrV[nrm(name:gsub("^[Cc]hroma ", ""))] = val end
-                    end
-                else
-                    for name, raw in body:gmatch("<b>([^<]+)</b><br> Value: ([%d,]+)") do
-                        local val = tonumber((raw:gsub(",", "")))
-                        if val then allV[nrm(name)] = val end
-                    end
-                end
-            end)
-            done = done + 1
-        end)
+    while alive() do
+        task.wait(600)
+        local n = 0
+        for _ in pairs(visited) do n = n + 1 end
+        if n > 400 then
+            local cur = tostring(game.JobId)
+            for k in pairs(visited) do
+                if k ~= cur then visited[k] = nil end
+            end
+            visited[cur] = true
+            logMsg("Pruned visited-server list (" .. n .. " entries)")
+        end
     end
-    local polls = 0
-    while done < #pages and polls < 100 do task.wait(0.2); polls = polls + 1 end
-    if next(allV) then
-        getgenv()._aj_mmValCache = { allV = allV, chrV = chrV, ts = os.time() }
-        warn("[AJ] Value cache loaded")
+end)
+
+-- Pre-load mm2values.com cache in background so item values in trade webhooks are never 0,
+-- then refresh it every 30 min so a multi-day session never drifts stale.
+task.spawn(function()
+    while alive() do
+        local c = getValueCache()
+        if c and next(c.allV or {}) then warn("[AJ] Value cache loaded") end
+        task.wait(VALUE_TTL)
+    end
+end)
+
+-- Periodic GC. A 24/7 session accumulates a lot of short-lived request/JSON
+-- garbage; letting it pile up is what turns a two-day uptime into a crash.
+task.spawn(function()
+    while alive() do
+        task.wait(300)
+        pcall(function() collectgarbage("collect") end)
     end
 end)
