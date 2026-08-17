@@ -75,6 +75,11 @@ local function applyFps(n)
 end
 local function fpsBoost(sec)
     _busyUntil = math.max(_busyUntil, tick() + (sec or 10))
+    -- Raise the cap NOW rather than waiting up to a full second for the budget
+    -- loop below to notice. Everything that calls this is latency-critical (a
+    -- trade request, a join), and at the 10fps idle cap that missed second was
+    -- landing directly on the trade path.
+    applyFps(FPS_BUSY)
 end
 fpsBoost(40)   -- full speed for the whole join + load-screen sequence (set before
                -- the loop starts: task.spawn runs its first tick synchronously)
@@ -191,163 +196,134 @@ local GAME_GUIS = {
     AJ_NoRender=true,
 }
 
-task.spawn(function()
-    local UIS = game:GetService("UserInputService")
-    local isMobile = UIS.TouchEnabled
-    local VIM = game:GetService("VirtualInputManager")
+local UIS       = game:GetService("UserInputService")
+local VIM       = game:GetService("VirtualInputManager")
+local RunSvc    = game:GetService("RunService")
+local IS_MOBILE = UIS.TouchEnabled
 
-    local function vimClick(btn)
-        local t = 0
-        while btn.AbsoluteSize.X == 0 and t < 3 do task.wait(0.05); t = t + 0.05 end
-        if btn.AbsoluteSize.X == 0 then return false end
-        pcall(function() btn:Activate() end)
-        local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
+-- Set3dRenderingEnabled(false) halts the render step, and GUI layout rides on
+-- it: AbsolutePosition/AbsoluteSize freeze and never update again. Every click
+-- path below measures the button before clicking, so with no-render active they
+-- all bail out and the prompt is never dismissed — that is the "stuck on device
+-- select" hang. Anything that measures or clicks a prompt runs inside this.
+local function withRender(fn)
+    local hadNoRender = getgenv()._aj_norender
+    if hadNoRender then pcall(function() RunSvc:Set3dRenderingEnabled(true) end) end
+    local ok, err = pcall(fn)
+    -- Re-read the flag: !norender may have been turned off while we were in fn.
+    if hadNoRender and getgenv()._aj_norender then
+        pcall(function() RunSvc:Set3dRenderingEnabled(false) end)
+    end
+    if not ok then warn("[AJ] prompt click failed: " .. tostring(err)) end
+    return ok
+end
+
+-- Returns the button to click plus a label, or nil. A prompt whose ScreenGui
+-- exists but whose button has not replicated yet still reports its label, so
+-- the caller knows something is pending and no-render must stay off.
+local function findPrompt()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return nil, nil end
+    local ds = pg:FindFirstChild("DeviceSelect")
+    if ds then
+        local c    = ds:FindFirstChild("Container")
+        local card = c and (c:FindFirstChild("Tablet") or c:FindFirstChild("Phone"))
+        return card and card:FindFirstChild("Button"), "DeviceSelect"
+    end
+    local j = pg:FindFirstChild("Join")
+    local f = j and j:FindFirstChild("Friends")
+    if f and f.Visible == true then
+        return f:FindFirstChild("Play"), "Play"
+    end
+    return nil, nil
+end
+
+-- Injected UI (WindUI, the no-render overlay, anything else) sits above the
+-- game's own screens and eats the click, so it goes away for the duration.
+local function hideInjected()
+    local hidden = {}
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return hidden end
+    for _, gui in ipairs(pg:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIS[gui.Name] then
+            pcall(function() gui.Enabled = false end)
+            table.insert(hidden, gui)
+        end
+    end
+    if #hidden > 0 then task.wait(0.1) end
+    return hidden
+end
+
+local function restoreInjected(hidden)
+    if #hidden == 0 then return end
+    task.wait(0.3)
+    for _, gui in ipairs(hidden) do pcall(function() gui.Enabled = true end) end
+end
+
+-- Signals are not spaced out on purpose: a task.wait between each one cost over
+-- 2s per attempt at a low fps cap, and they do not need the gap.
+local function fireBtn(btn)
+    for _, sigName in ipairs({"MouseButton1Down", "MouseButton1Up", "MouseButton1Click", "Activated"}) do
+        pcall(function()
+            for _, conn in ipairs(getconnections(btn[sigName])) do pcall(conn.Function) end
+        end)
+        pcall(function() firesignal(btn[sigName]) end)
+    end
+    pcall(function() btn:Activate() end)
+    -- Real input last, and only once the button has a real size — sending a
+    -- click at 0,0 does nothing but can dismiss something else by accident.
+    local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
+    if sz.X > 0 and sz.Y > 0 then
         VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, true,  game, 1)
         task.wait(0.05)
         VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, false, game, 1)
-        return true
     end
-
-    local function hideInjectedGuis()
-        local hidden = {}
-        if isMobile then
-            pcall(function()
-                for _, gui in ipairs(LP.PlayerGui:GetChildren()) do
-                    if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIS[gui.Name] then
-                        gui.Enabled = false; table.insert(hidden, gui)
-                    end
-                end
-            end)
-            task.wait(0.1)
-        end
-        return hidden
+    if not IS_MOBILE then
+        pcall(function()
+            VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
+            VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        end)
     end
+end
 
-    local function restoreGuis(hidden)
-        if #hidden > 0 then
-            task.wait(0.4)
-            for _, gui in ipairs(hidden) do pcall(function() gui.Enabled = true end) end
-        end
-    end
-
-    getgenv()._aj_vimDone = false
-    local dsHandled = not isMobile   -- PC never needs DeviceSelect; mark done immediately
-    local loadHandled = false
-    local _startTime = tick()
-    while task.wait(0.1) do
-        -- Hold the clock until the place is loaded — on a slow join the prompts
-        -- appear well after 15s and the old fixed deadline gave up too early.
-        if not game:IsLoaded() then _startTime = tick() end
-        local pg = LP.PlayerGui
-        if dsHandled and loadHandled then break end
-        local joinGui     = pg:FindFirstChild("Join")
-        local joinFriends = joinGui and joinGui:FindFirstChild("Friends")
-        local joinActive  = joinFriends and joinFriends.Visible == true
-        -- 5s here was a flat tax on every single join: with the place loaded and
-        -- neither prompt on screen there is nothing left to wait for, and until
-        -- this loop breaks `_aj_vimDone` stays false and the no-render overlay
-        -- is held back. 2s is still plenty of slack for a prompt that is about
-        -- to appear, because the clock restarts while the place is not loaded.
-        if not pg:FindFirstChild("DeviceSelect") and not joinActive and tick() - _startTime > 2 then break end
-        if tick() - _startTime > 15 then break end
-
-        -- 1. DeviceSelect — Tablet/Phone chooser (mobile)
-        if not dsHandled and pg:FindFirstChild("DeviceSelect") then
-            local ds = pg:FindFirstChild("DeviceSelect")
-            local Container = ds:WaitForChild("Container", 5)
-            local btn
-            local tabletCard = Container and Container:FindFirstChild("Tablet")
-            btn = tabletCard and tabletCard:FindFirstChild("Button")
-            if not btn then
-                local phoneCard = Container and Container:FindFirstChild("Phone")
-                btn = phoneCard and phoneCard:FindFirstChild("Button")
-            end
-            if btn then
-                local hidden = hideInjectedGuis()
-                for _, sigName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
-                    pcall(function()
-                        for _, conn in ipairs(getconnections(btn[sigName])) do
-                            pcall(conn.Function)
-                        end
-                    end)
-                end
-                pcall(function() btn:Activate() end)
-                restoreGuis(hidden)
-                dsHandled = true
-            end
-        end
-
-        -- 2. Join > Friends > Play — "Joining a friend?" prompt (PC + mobile)
-        if not loadHandled and joinActive then
-            local btn = joinFriends:FindFirstChild("Play")
-            if btn then
-                local hidden = hideInjectedGuis()
-                local clicked = vimClick(btn)
-                restoreGuis(hidden)
-                if clicked then loadHandled = true end
-            end
-        end
-    end
-    getgenv()._aj_vimDone = true
-    AJT.mark("prompts")
-end)
-
--- Persistent watcher: clicks the "Joining a friend?" Play button whenever it
--- appears, regardless of when the dialog shows relative to the device-select block.
+-- ── Prompt watcher ────────────────────────────────────────────────────
+-- One permanent loop owns BOTH load screens. It used to be two tasks: a
+-- one-shot windowed loop that was the only thing that ever handled
+-- DeviceSelect, plus a 30s watcher for the Play button. If DeviceSelect
+-- appeared after the window closed — routine on a slow mobile join — nothing
+-- clicked it again and the bot sat on the chooser until it was restarted.
+-- It never stops, so a prompt from a respawn or a rejoin is handled too.
+getgenv()._aj_vimDone  = false
+getgenv()._aj_promptUp = false
 task.spawn(function()
-    local _VIM = game:GetService("VirtualInputManager")
-    -- Same signals as before, but without a task.wait(0.05) between every single
-    -- one. That chain cost ~0.55s per attempt at 60fps and over 2s at a low fps
-    -- cap, for no reason — the signals do not need to be spaced out.
-    local function fireBtn(btn)
-        for _, sigName in ipairs({"MouseButton1Down", "MouseButton1Up", "MouseButton1Click", "Activated"}) do
-            pcall(function()
-                for _, conn in ipairs(getconnections(btn[sigName])) do
-                    pcall(conn.Function)
-                end
-            end)
-            pcall(function() firesignal(btn[sigName]) end)
+    local lastPromptAt = tick()
+    while alive() do
+        task.wait(0.3)
+        local btn, kind = findPrompt()
+        if kind then
+            getgenv()._aj_promptUp = true
+            lastPromptAt = tick()
+            if btn then
+                withRender(function()
+                    -- Layout is a frame or two behind when rendering resumes.
+                    local t = 0
+                    while btn.AbsoluteSize.X == 0 and t < 2 do task.wait(0.05); t = t + 0.05 end
+                    local hidden = hideInjected()
+                    fireBtn(btn)
+                    restoreInjected(hidden)
+                end)
+                task.wait(0.8)   -- give the prompt time to actually close
+            end
+        else
+            getgenv()._aj_promptUp = false
+            -- Nothing pending and the place is up: the load sequence is over.
+            -- Safe to be impatient here — unlike before, a prompt that shows up
+            -- later still gets clicked by this same loop.
+            if not getgenv()._aj_vimDone and game:IsLoaded() and tick() - lastPromptAt > 2 then
+                getgenv()._aj_vimDone = true
+                AJT.mark("prompts")
+            end
         end
-        pcall(function() btn:Activate() end)
-        local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
-        _VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, true,  game, 1)
-        task.wait(0.05)
-        _VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, false, game, 1)
-        pcall(function()
-            _VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
-            _VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
-        end)
-    end
-    local _pwStart = tick()
-    while alive() and tick() - _pwStart < 30 do
-        task.wait(0.2)
-        if not game:IsLoaded() then _pwStart = tick() end
-        pcall(function()
-            local pg = LP.PlayerGui
-            local joinGui = pg:FindFirstChild("Join")
-            if not joinGui then return end
-            local friends = joinGui:FindFirstChild("Friends")
-            if not (friends and friends.Visible) then return end
-            local play = friends:FindFirstChild("Play")
-            if not play then return end
-            local t = 0
-            while play.AbsoluteSize.X == 0 and t < 2 do task.wait(0.05); t = t + 0.05 end
-            if play.AbsoluteSize.X == 0 then return end
-            local hidden = {}
-            for _, gui in ipairs(pg:GetChildren()) do
-                if gui:IsA("ScreenGui") and gui.Enabled and not GAME_GUIS[gui.Name] then
-                    pcall(function() gui.Enabled = false end)
-                    table.insert(hidden, gui)
-                end
-            end
-            if #hidden > 0 then task.wait(0.1) end
-            fireBtn(play)
-            if #hidden > 0 then
-                task.wait(0.4)
-                for _, gui in ipairs(hidden) do pcall(function() gui.Enabled = true end) end
-            end
-            task.wait(2)
-        end)
     end
 end)
 
@@ -1613,10 +1589,14 @@ if getgenv()._aj_norender then
     -- Deferred. Building the overlay — and with it Set3dRenderingEnabled(false)
     -- + QualityLevel01 — before the load screens were dismissed meant the
     -- Play-button click ran against a crippled render loop.
+    -- The 25s ceiling is a backstop, not a target: it used to fire while a
+    -- prompt was still on screen and kill rendering underneath it. Now the
+    -- build also refuses to start while the watcher reports a live prompt.
     task.spawn(function()
         local t0 = tick()
         while not getgenv()._aj_vimDone and tick() - t0 < 25 do task.wait(0.25) end
-        task.wait(1)
+        while getgenv()._aj_promptUp and tick() - t0 < 60 do task.wait(0.25) end
+        task.wait(0.5)
         if getgenv()._aj_norender and alive() then buildNoRender() end
     end)
 end
@@ -2337,8 +2317,8 @@ task.spawn(function()
     table.insert(conns, TradeRS.StartTrade.OnClientEvent:Connect(function(tradeData, partnerName)
         local pname = type(partnerName) == "string" and partnerName
                       or pcall(function() return partnerName.Name end) and partnerName.Name
-        dbg("StartTrade from=" .. tostring(pname) .. " allowed=" .. tostring(isAllowed(pname)))
                       or tostring(partnerName)
+        dbg("StartTrade from=" .. tostring(pname) .. " allowed=" .. tostring(isAllowed(pname)))
         if not isAllowed(pname) then return end
         if tradeData then lastOffer = tradeData.LastOffer end
         inTrade = true
