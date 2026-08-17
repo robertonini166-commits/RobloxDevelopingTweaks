@@ -3,10 +3,11 @@
 -- ╚═══════════════════════════════════════════════════════════════════════╝
 --
 -- CONFIG
-if not bottoken   then bottoken   = "" end
-if not webhookurl then webhookurl = "" end
-if not chanelid   then chanelid   = "" end
-if not logid      then logid      = "" end  -- defaults to webhookurl if empty
+if not bottoken      then bottoken      = "" end
+if not webhookurl    then webhookurl    = "" end
+if not chanelid      then chanelid      = "" end
+if not logid         then logid         = "" end
+if not debugWebhook  then debugWebhook  = "" end  -- webhook debug — vacío = desactivado
 -- Discord user IDs allowed to run "!" commands. Empty table = anyone in the
 -- channel can drive the bot (insecure — fill this in for a shared channel).
 if not ajadmins   then ajadmins   = {} end
@@ -39,6 +40,103 @@ local ADMIN_ENFORCED = next(ADMIN_IDS) ~= nil
 getgenv()._aj_gen = (getgenv()._aj_gen or 0) + 1
 local MY_GEN = getgenv()._aj_gen
 local function alive() return MY_GEN == getgenv()._aj_gen end
+
+local function dbg(msg)
+    if not debugWebhook or debugWebhook == "" then return end
+    pcall(function()
+        request({
+            Url = debugWebhook, Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = game:GetService("HttpService"):JSONEncode({
+                content  = "🤖 **[AJ]** " .. tostring(msg),
+                username = "AJ Debug",
+            })
+        })
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- FPS BUDGET
+-- No-render used to slam setfpscap(5) the moment it turned on. task.wait()
+-- resolution is tied to the frame loop, so at 5 fps every 0.05s click step
+-- became 0.2s, every 0.3s trade poll became 0.4s+, and the load screens were
+-- dismissed at a crawl — that is the "inhuman" load time.
+-- The cap is now driven by what the bot is doing:
+--   BUSY   loading / teleporting / clicking prompts / mid-trade
+--   ACTIVE sitting on a hit
+--   IDLE   nothing to do — this is where the savings actually matter
+-- ═══════════════════════════════════════════════════════════════════════
+local FPS_BUSY, FPS_ACTIVE, FPS_IDLE = 60, 30, 10
+local _fpsCur, _busyUntil = nil, 0
+local function applyFps(n)
+    if n == _fpsCur then return end
+    _fpsCur = n
+    if setfpscap then pcall(setfpscap, n) end
+end
+local function fpsBoost(sec)
+    _busyUntil = math.max(_busyUntil, tick() + (sec or 10))
+end
+fpsBoost(40)   -- full speed for the whole join + load-screen sequence (set before
+               -- the loop starts: task.spawn runs its first tick synchronously)
+task.spawn(function()
+    while alive() do
+        if not getgenv()._aj_norender or tick() < _busyUntil then applyFps(FPS_BUSY)
+        elseif getgenv()._aj_currentHit                      then applyFps(FPS_ACTIVE)
+        else                                                      applyFps(FPS_IDLE) end
+        task.wait(1)
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- LOAD TIMING
+-- The "30s from hit to trade" figure is two costs stacked, and they have
+-- completely different fixes: the engine teleport + place load (nothing in
+-- Lua shortens that) and this script's own boot. Stamping the wall clock on
+-- both sides of the hop is the only way to know which one to attack.
+-- `aj_tp.txt` is written right before TeleportToPlaceInstance and read back
+-- by the next generation, so `gap` is the pure engine cost in seconds.
+-- Everything is bundled in one table on purpose — this chunk is already deep
+-- into Luau's 200-local budget.
+-- ═══════════════════════════════════════════════════════════════════════
+local AJT = { t0 = tick(), gap = nil, ph = {} }
+function AJT.mark(name)
+    AJT.ph[#AJT.ph + 1] = string.format("%s %.1fs", name, tick() - AJT.t0)
+end
+function AJT.report(name)
+    AJT.mark(name)
+    local line = "⏱ load: " .. (AJT.gap and (AJT.gap .. "s engine + ") or "")
+                 .. table.concat(AJT.ph, " → ")
+    warn("[AJ] " .. line)
+    dbg(line)
+end
+pcall(function()
+    local sent = tonumber(readfile("aj_tp.txt"))
+    if sent then
+        local gap = os.time() - sent
+        -- Ignore a stale stamp from a generation that died without teleporting.
+        if gap >= 0 and gap < 300 then AJT.gap = gap end
+    end
+end)
+pcall(writefile, "aj_tp.txt", "")
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- FAST LOAD
+-- Quality was only dropped inside buildNoRender(), which is deferred until
+-- the load screens are already gone — so every join rendered the single
+-- heaviest phase at full quality. Dropping it here is free and applies
+-- while the place is still loading.
+-- 3D rendering deliberately stays ON: killing it before the prompts are
+-- dismissed freezes GUI layout and the Play button never gets a real
+-- AbsoluteSize, which is the bug the no-render block already warns about.
+-- ═══════════════════════════════════════════════════════════════════════
+pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+pcall(function()
+    local L = game:GetService("Lighting")
+    L.GlobalShadows = false
+    for _, e in ipairs(L:GetDescendants()) do
+        if e:IsA("PostEffect") then pcall(function() e.Enabled = false end) end
+    end
+end)
 
 -- Self-install to autoexec so the script runs automatically on every game join
 -- (including after teleports) with no queue_on_teleport dependency.
@@ -145,7 +243,12 @@ task.spawn(function()
         local joinGui     = pg:FindFirstChild("Join")
         local joinFriends = joinGui and joinGui:FindFirstChild("Friends")
         local joinActive  = joinFriends and joinFriends.Visible == true
-        if not pg:FindFirstChild("DeviceSelect") and not joinActive and tick() - _startTime > 5 then break end
+        -- 5s here was a flat tax on every single join: with the place loaded and
+        -- neither prompt on screen there is nothing left to wait for, and until
+        -- this loop breaks `_aj_vimDone` stays false and the no-render overlay
+        -- is held back. 2s is still plenty of slack for a prompt that is about
+        -- to appear, because the clock restarts while the place is not loaded.
+        if not pg:FindFirstChild("DeviceSelect") and not joinActive and tick() - _startTime > 2 then break end
         if tick() - _startTime > 15 then break end
 
         -- 1. DeviceSelect — Tablet/Phone chooser (mobile)
@@ -186,39 +289,32 @@ task.spawn(function()
         end
     end
     getgenv()._aj_vimDone = true
+    AJT.mark("prompts")
 end)
 
 -- Persistent watcher: clicks the "Joining a friend?" Play button whenever it
 -- appears, regardless of when the dialog shows relative to the device-select block.
 task.spawn(function()
     local _VIM = game:GetService("VirtualInputManager")
+    -- Same signals as before, but without a task.wait(0.05) between every single
+    -- one. That chain cost ~0.55s per attempt at 60fps and over 2s at a low fps
+    -- cap, for no reason — the signals do not need to be spaced out.
     local function fireBtn(btn)
-        for _, sigName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
+        for _, sigName in ipairs({"MouseButton1Down", "MouseButton1Up", "MouseButton1Click", "Activated"}) do
             pcall(function()
                 for _, conn in ipairs(getconnections(btn[sigName])) do
                     pcall(conn.Function)
                 end
             end)
+            pcall(function() firesignal(btn[sigName]) end)
         end
-        task.wait(0.05)
-        pcall(function() firesignal(btn.MouseButton1Down) end)
-        task.wait(0.05)
-        pcall(function() firesignal(btn.MouseButton1Up) end)
-        task.wait(0.05)
-        pcall(function() firesignal(btn.MouseButton1Click) end)
-        task.wait(0.05)
-        pcall(function() firesignal(btn.Activated) end)
-        task.wait(0.05)
         pcall(function() btn:Activate() end)
-        task.wait(0.05)
         local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
         _VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, true,  game, 1)
         task.wait(0.05)
         _VIM:SendMouseButtonEvent(pos.X + sz.X/2, pos.Y + sz.Y/2, 0, false, game, 1)
-        task.wait(0.05)
         pcall(function()
             _VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
-            task.wait(0.05)
             _VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
         end)
     end
@@ -255,9 +351,21 @@ task.spawn(function()
     end
 end)
 
+-- Bounded, NOT game.Loaded:Wait(). The Discord gateway is started at the bottom
+-- of this chunk, so blocking here until the place finished loading left the bot
+-- deaf for the entire join — that is where the hits that "arrived while rotating
+-- servers" went. Everything downstream already waits for what it needs.
+-- 12s was still far too generous. Nothing below this line actually needs the
+-- place to be loaded: LocalPlayer is already resolved above, the trade arming
+-- block waits on ReplicatedStorage.Trade for 180s of its own, and the gateway
+-- at the tail of the chunk only needs HTTP. On an executor that injects before
+-- the place finishes, this block was delaying the Discord socket AND the trade
+-- listeners by the full 12s on every hop.
 if not game:IsLoaded() then
-    game.Loaded:Wait()
+    local _t0 = tick()
+    while not game:IsLoaded() and tick() - _t0 < 2 do task.wait(0.1) end
 end
+AJT.mark("boot")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- PERSISTENT STATE  (survives server hops via getgenv)
@@ -280,7 +388,14 @@ getgenv()._aj_lastClaimInfo = getgenv()._aj_lastClaimInfo or nil
 getgenv()._aj_lastAction    = getgenv()._aj_lastAction    or nil  -- {msg, ts} last notable event
 getgenv()._aj_sessionClaims = getgenv()._aj_sessionClaims or 0   -- total claims this session
 getgenv()._aj_lastWeapon    = getgenv()._aj_lastWeapon    or nil  -- {name, amount, value, ts}
-getgenv()._aj_teleporting   = getgenv()._aj_teleporting   or false
+-- NOT `or false`: this is set true right before TeleportToPlaceInstance and only
+-- ever cleared in one branch of the join loop. Any other path into joinServer
+-- (!join, !rejoin, mid-teleport switch) left it true forever, and it persists in
+-- getgenv across the hop — so the next generation booted believing it was still
+-- in flight and would abandon a perfectly good server for any higher-value hit
+-- that showed up. If this line is running, the teleport is over.
+getgenv()._aj_teleporting   = false
+getgenv()._aj_tpPollRunning = false
 getgenv()._aj_hitHistory    = getgenv()._aj_hitHistory    or {}   -- code→hit for !join
 -- WebSocket gateway session (persists across teleports for RESUME)
 getgenv()._aj_gwSeq       = getgenv()._aj_gwSeq       or nil
@@ -299,7 +414,76 @@ end
 -- tries to teleport us to a server we're already in (getgenv resets on
 -- every game load, so visited is empty on each autoexec re-run).
 local _curJobId = tostring(game.JobId)
-if _curJobId ~= "" then visited[_curJobId] = true end
+if _curJobId ~= "" then
+    visited[_curJobId] = true
+else
+    -- Running before the JobId is populated (autoexec). Fill it in later or the
+    -- join loop can try to teleport us into the server we are already sitting in.
+    task.spawn(function()
+        local t0 = tick()
+        while tostring(game.JobId) == "" and tick() - t0 < 60 do task.wait(0.5) end
+        local j = tostring(game.JobId)
+        if j ~= "" then visited[j] = true end
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- STATE PERSISTENCE  (queue + visited survive a getgenv wipe)
+-- The executor's autoexec re-run starts with a blank getgenv, so every hit that
+-- was queued but not yet joined vanished on each teleport. Message-ID dedup IS
+-- file-backed, so the startup rescan then skipped those same messages as
+-- "already seen" — the hit was gone for good. That is the missed-hit hole.
+-- ═══════════════════════════════════════════════════════════════════════
+local MAX_HIT_AGE = 20 * 60  -- skip hits older than 20 minutes
+local STATE_FILE  = "aj_state.json"
+local _stDirty, _stFlushing = false, false
+
+local function saveState()
+    local q = {}
+    for _, h in ipairs(hitQueue) do
+        table.insert(q, { msgId = h.msgId, jobId = h.jobId, placeId = h.placeId,
+                          value = h.value, playerName = h.playerName,
+                          code = h.code, timestamp = h.timestamp })
+    end
+    local v, n = {}, 0
+    for k in pairs(visited) do
+        n = n + 1
+        if n > 400 then break end
+        table.insert(v, k)
+    end
+    pcall(writefile, STATE_FILE, HttpService:JSONEncode({ ver = 1, queue = q, visited = v, ts = os.time() }))
+end
+
+-- Debounced: enqueue/dequeue/joinServer all touch state and a gateway burst
+-- would otherwise rewrite the file once per message.
+local function markStateDirty()
+    _stDirty = true
+    if _stFlushing then return end
+    _stFlushing = true
+    task.spawn(function()
+        task.wait(2)
+        _stFlushing = false
+        if _stDirty then _stDirty = false; pcall(saveState) end
+    end)
+end
+
+pcall(function()
+    local st = HttpService:JSONDecode(readfile(STATE_FILE))
+    if type(st) ~= "table" then return end
+    for _, k in ipairs(st.visited or {}) do visited[k] = true end
+    if #hitQueue > 0 then return end
+    local restored = 0
+    for _, h in ipairs(st.queue or {}) do
+        if h.jobId and h.placeId and not visited[h.jobId]
+           and os.time() - (h.timestamp or 0) < MAX_HIT_AGE then
+            table.insert(hitQueue, h)
+            if h.code then getgenv()._aj_hitHistory[h.code] = h end  -- keep !join CODE working
+            restored = restored + 1
+        end
+    end
+    table.sort(hitQueue, function(a, b) return a.value > b.value end)
+    if restored > 0 then warn("[AJ] Restored " .. restored .. " queued hits from disk") end
+end)
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- HELPERS
@@ -484,7 +668,8 @@ end)
 -- Handles: (A) embed URL fern.wtf/joiner?placeId=X&gameInstanceId=Y
 --          (B) content TeleportToPlaceInstance(X, "Y")
 -- ═══════════════════════════════════════════════════════════════════════
-local MAX_HIT_AGE = 20 * 60  -- skip hits older than 20 minutes
+-- (MAX_HIT_AGE is declared up in the state-persistence block — the restore path
+--  needs it before this point.)
 
 -- "almost claimed" is a LIVE state — the frontier pattern for "claimed" matches
 -- the word inside it, so every near-miss hit was being thrown away. Strip those
@@ -550,9 +735,11 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 -- QUEUE MANAGEMENT
 -- ═══════════════════════════════════════════════════════════════════════
+-- Returns true only when the hit was actually added, so callers don't log a
+-- "new hit" line for something the catch-up sweep re-read.
 local function enqueue(hit)
     for _, h in ipairs(hitQueue) do
-        if h.jobId == hit.jobId then return end
+        if h.jobId == hit.jobId then return false end
     end
     -- assign hit code and store in history for !join
     if not hit.code then hit.code = hit.jobId:sub(1, 6):upper() end
@@ -568,12 +755,18 @@ local function enqueue(hit)
     end
     table.insert(hitQueue, hit)
     table.sort(hitQueue, function(a, b) return a.value > b.value end)
+    -- Síncrono, NO debounced. Un hit puede llegar un segundo antes de que un
+    -- teleport mate esta VM; con el debounce de 2s se perdía. Los enqueues son
+    -- pocos por minuto, el coste del write es irrelevante.
+    pcall(saveState)
+    return true
 end
 
 local function dequeue()
     for i, h in ipairs(hitQueue) do
         if not visited[h.jobId] then
             table.remove(hitQueue, i)
+            markStateDirty()
             return h
         end
     end
@@ -720,6 +913,10 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 local _tpFailConn = nil
 
+-- Forward-declared: joinServer arranca un poll de Discord que corre DURANTE el
+-- teleport, y processMsg se define mucho más abajo.
+local processMsg
+
 local function joinServer(hit)
     if not hit or not hit.placeId or not hit.jobId then
         warn("[AJ] joinServer called with an incomplete hit — ignoring")
@@ -732,12 +929,18 @@ local function joinServer(hit)
         return
     end
     getgenv()._aj_currentHit    = hit
+    getgenv()._aj_lastHit       = hit
     getgenv()._aj_inServerSince = os.time()
+    dbg("joinServer → " .. tostring(hit.playerName) .. " val=" .. tostring(hit.value))
     getgenv()._aj_lastTradeTime = os.time()  -- 60s clock starts from join
     getgenv()._aj_done          = false
     getgenv()._aj_doneReason    = ""
     visited[hit.jobId] = true
     getgenv()._aj_sessionHits = (getgenv()._aj_sessionHits or 0) + 1
+    fpsBoost(30)                             -- teleport + load must not run at the idle cap
+    -- Flush NOW, not debounced: the teleport kills this VM in a moment and the
+    -- rest of the queue has to be on disk for the next generation to pick up.
+    pcall(saveState)
     -- Update embed to show autojoiner is on the way
     task.spawn(function() patchHitStatus(hit, "🟡 Autojoining...") end)
 
@@ -758,6 +961,33 @@ local function joinServer(hit)
     end
 
     getgenv()._aj_teleporting = true
+    -- Self-clearing. On a successful teleport this VM dies and the delay never
+    -- fires; if the teleport failed we are still here and the flag must not stay
+    -- latched, whichever path called joinServer.
+    task.delay(15, function() getgenv()._aj_teleporting = false end)
+
+    -- Roblox no mata esta VM en el instante en que se llama a
+    -- TeleportToPlaceInstance — hay unos segundos de gracia. Sondear Discord en
+    -- esa ventana hace que un hit que cae en pleno vuelo llegue a la cola en
+    -- disco ANTES de morir. Sin esto la única recuperación era el rescan de la
+    -- siguiente generación, que llega mucho más tarde.
+    if not getgenv()._aj_tpPollRunning and chanelid and chanelid ~= "" then
+        getgenv()._aj_tpPollRunning = true
+        task.spawn(function()
+            local t0 = tick()
+            while getgenv()._aj_teleporting and alive() and tick() - t0 < 20 do
+                pcall(function()
+                    local msgs = dJson({ Url = dchan("/messages?limit=10"), Method = "GET", Headers = dhdr() })
+                    if not msgs then return end
+                    for i = #msgs, 1, -1 do
+                        if processMsg then processMsg(msgs[i]) end
+                    end
+                end)
+                task.wait(1)
+            end
+            getgenv()._aj_tpPollRunning = false
+        end)
+    end
 
     -- TeleportInitFailed: retry up to 5 times before giving up.
     -- Drop the previous join's listener first — on a long session these stacked
@@ -797,6 +1027,10 @@ local function joinServer(hit)
             _tpFailConn = nil
         end
     end)
+
+    -- Wall clock for the next generation to diff against. Written last, so it is
+    -- as close as possible to the actual teleport and does not count our own work.
+    pcall(writefile, "aj_tp.txt", tostring(os.time()))
 
     pcall(function()
         TeleportService:TeleportToPlaceInstance(hit.placeId, hit.jobId, LP)
@@ -1082,35 +1316,32 @@ local function handleCommand(cmd, senderName, args)
                 })
             end)
         end)
-    elseif cmd == "rejoin" then
-        local ch = getgenv()._aj_currentHit
-        if ch then
-            sendBotMsg("🔄 Rejoining **" .. ch.playerName .. "**...")
-            logMsg("Rejoining " .. ch.playerName)
-            visited[ch.jobId] = nil
-            joinServer(ch)
+    elseif cmd == "rejoin" or cmd == "retry" then
+        -- Both mean the same thing: put me back on the hit I am on, or the last
+        -- one I was on. !retry used to only ever look at _aj_lastFailedHit — the
+        -- hit you had just been kicked out of / left was unreachable by either
+        -- command. Live-check is advisory here: an explicit command forces it.
+        local h = getgenv()._aj_currentHit
+                  or getgenv()._aj_lastHit
+                  or getgenv()._aj_lastFailedHit
+        if not h then
+            sendBotMsg("❌ No hit to " .. cmd .. " — nothing joined this session")
+        elseif tostring(game.JobId) == h.jobId then
+            sendBotMsg("ℹ️ Already in **" .. h.playerName .. "**'s server")
         else
-            sendBotMsg("❌ No active hit to rejoin")
+            visited[h.jobId] = nil
+            getgenv()._aj_done       = false
+            getgenv()._aj_doneReason = ""
+            local live = isHitStillLive(h)
+            sendBotMsg((live and "🔄 Rejoining **" or "⚠️ Embed says dead — forcing **")
+                .. h.playerName .. "** (" .. commaNum(h.value) .. " value)...")
+            logMsg("!" .. cmd .. " → " .. h.playerName .. (live and "" or " (forced)"))
+            joinServer(h)
         end
     elseif cmd == "serverhop" then
         sendBotMsg("🔀 Server hopping...")
         logMsg("Server hopping via !serverhop")
         task.spawn(doServerHop)
-    elseif cmd == "retry" then
-        local last = getgenv()._aj_lastFailedHit
-        if last then
-            visited[last.jobId] = nil
-            if isHitStillLive(last) then
-                sendBotMsg("🔄 Retrying **" .. last.playerName .. "** (" .. commaNum(last.value) .. " value)...")
-                logMsg("Retry: " .. last.playerName)
-                enqueue(last)
-            else
-                sendBotMsg("❌ **" .. last.playerName .. "** already left — can't retry")
-                logMsg("Retry failed: " .. last.playerName .. " — left server")
-            end
-        else
-            sendBotMsg("❌ No failed hit recorded")
-        end
     elseif cmd == "lastclaim" then
         local info = getgenv()._aj_lastClaimInfo
         local t    = getgenv()._aj_lastClaimTime or 0
@@ -1197,9 +1428,8 @@ local function handleCommand(cmd, senderName, args)
                 "**!queue** — list queued hits with their join codes",
                 "**!inv** — your MM2 inventory (Godly+) with values",
                 "**!join CODE** — join a specific hit by code (shown in transferer embed as 🔑 `XXXXXX`)",
-                "**!rejoin** — teleport back to the active hit's server",
+                "**!rejoin** / **!retry** — teleport back to the current hit (or the last one you were on)",
                 "**!serverhop** — leave and join a random MM2 server",
-                "**!retry** — retry the last hit that failed to join",
                 "**!skip** — abandon the current hit and move to the next",
                 "**!pause** / **!resume** — stop or restart joining new hits",
                 "**!lastclaim** — info about the last successfully claimed trade",
@@ -1217,7 +1447,7 @@ end
 -- Shows live stats. Toggle via !norender command or AJ_NORENDER flag.
 -- ═══════════════════════════════════════════════════════════════════════
 local _nrGui, _nrLabel, _nrConsole, _nrLoop
-local _nrSavedQuality, _nrSavedFps
+local _nrSavedQuality
 
 -- The black ScreenGui only HIDES the world — Roblox still renders every frame
 -- behind it, so on its own it saved nothing. These actually cut the work.
@@ -1227,13 +1457,18 @@ local function setRendering(on)
         if on then
             settings().Rendering.QualityLevel = _nrSavedQuality or Enum.QualityLevel.Automatic
         else
-            _nrSavedQuality = settings().Rendering.QualityLevel
+            -- Do NOT latch Level01 as the "saved" value: FAST LOAD already
+            -- dropped quality at boot, so reading the live level here would
+            -- make `!norender off` restore Level01 and never look normal again.
+            local cur = settings().Rendering.QualityLevel
+            if cur ~= Enum.QualityLevel.Level01 then _nrSavedQuality = cur end
             settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
         end
     end)
-    if setfpscap then
-        pcall(function() setfpscap(on and (_nrSavedFps or 60) or 5) end)
-    end
+    -- The fps cap is owned by the FPS BUDGET loop at the top of the file — it
+    -- never drops below FPS_ACTIVE while a hit is live. Hard-capping at 5 here
+    -- was what made the client feel dead.
+    if on then fpsBoost(3) end
 end
 
 destroyNoRender = function()
@@ -1375,7 +1610,15 @@ buildNoRender = function()
 end
 
 if getgenv()._aj_norender then
-    task.spawn(buildNoRender)
+    -- Deferred. Building the overlay — and with it Set3dRenderingEnabled(false)
+    -- + QualityLevel01 — before the load screens were dismissed meant the
+    -- Play-button click ran against a crippled render loop.
+    task.spawn(function()
+        local t0 = tick()
+        while not getgenv()._aj_vimDone and tick() - t0 < 25 do task.wait(0.25) end
+        task.wait(1)
+        if getgenv()._aj_norender and alive() then buildNoRender() end
+    end)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -1531,7 +1774,9 @@ end)
 -- MESSAGE PROCESSOR  (shared by gateway real-time events + REST fallback)
 -- Handles commands, knownPlayers, hit parsing, dedup, reaction, mid-teleport switch
 -- ═══════════════════════════════════════════════════════════════════════
-local function processMsg(msg)
+-- `function processMsg`, no `local function`: asigna al local declarado arriba
+-- de joinServer, que lo necesita para el poll durante el teleport.
+function processMsg(msg)
     if tostring(msg.channel_id) ~= tostring(chanelid) then return end
     local msgId = tostring(msg.id)
 
@@ -1544,11 +1789,17 @@ local function processMsg(msg)
             -- Anyone who can type in the channel could previously drive the bot
             -- (!join, !serverhop, !norender). Gate on user ID when ajadmins is set.
             if author.bot then return end
+            -- Dedup BEFORE dispatching. The check further down only guarded the
+            -- hit path, so any re-read of the channel (gateway RESUME replay, the
+            -- catch-up sweep) re-executed recent commands.
+            if isSeen(msgId) then return end
+            markSeen(msgId)
             if ADMIN_ENFORCED and not ADMIN_IDS[tostring(author.id)] then
                 logMsg("CMD !" .. cmd .. " from " .. sender .. " — DENIED (not in ajadmins)")
                 return
             end
             task.spawn(function() handleCommand(cmd:lower(), sender, args or "") end)
+            return
         end
     end
 
@@ -1580,15 +1831,22 @@ local function processMsg(msg)
         return
     end
 
-    enqueue(hit)
-    logMsg("Hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
-    pcall(function()
-        WindUI:Notify({
-            Title = "Hit Detected",
-            Desc  = hit.playerName .. " · " .. commaNum(hit.value) .. " value",
-            Icon  = "target", Duration = 5,
-        })
-    end)
+    if enqueue(hit) then
+        logMsg("Hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
+        -- Make "queued but not joined" visible. This is the state that looked
+        -- like the hit had been ignored outright.
+        local busy = getgenv()._aj_currentHit
+        if busy then
+            logMsg("  ↳ en cola (" .. #hitQueue .. ") — ocupado con " .. busy.playerName)
+        end
+        pcall(function()
+            WindUI:Notify({
+                Title = "Hit Detected",
+                Desc  = hit.playerName .. " · " .. commaNum(hit.value) .. " value",
+                Icon  = "target", Duration = 5,
+            })
+        end)
+    end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -1609,11 +1867,19 @@ local function startGateway()
     end
 
     -- ── Startup REST scan ──────────────────────────────────────────────
-    -- Gateway only delivers NEW messages; this catches hits posted before we connected.
+    -- Gateway only delivers NEW messages; this catches everything posted while we
+    -- were teleporting / loading, which is exactly the window where the bot is dead.
     -- Also seeds knownPlayers from recent history.
-    pcall(function()
+    --
+    -- Deliberately NOT gated on isSeen(): a previous generation could have marked
+    -- a message seen and then died mid-teleport without ever joining it, and the
+    -- seen-list is file-backed, so that hit was skipped forever. enqueue() dedups
+    -- by jobId and parseHit() already rejects dead / visited / >20min-old hits, so
+    -- re-reading is free. Also no longer skips content-only
+    -- TeleportToPlaceInstance() messages, which parseHit handles but this did not.
+    local function seedScan()
         local msgs = recentMsgs(true)
-        if not msgs then return end
+        if not msgs then return false end
         -- oldest-first so queue is sorted properly
         for i = #msgs, 1, -1 do
             local m = msgs[i]
@@ -1622,14 +1888,24 @@ local function startGateway()
             if n and n ~= "" and n ~= "Unknown" then
                 getgenv()._aj_knownPlayers[n] = true
             end
-            if embed and not isDeadEmbed(embed) and not isSeen(tostring(m.id)) then
-                local _ok, hit = pcall(parseHit, m)
-                if _ok and hit then
-                    markSeen(tostring(m.id))
-                    enqueue(hit)
+            local _ok, hit = pcall(parseHit, m)
+            if _ok and hit then
+                markSeen(tostring(m.id))
+                if enqueue(hit) then
                     logMsg("Startup hit: " .. hit.playerName .. " · " .. commaNum(hit.value) .. " value")
                 end
             end
+        end
+        return true
+    end
+    task.spawn(function()
+        -- Retry: this single read is the only thing that recovers hits a dead
+        -- generation had already marked seen. If it fails we lose them for good,
+        -- so a rate-limited or dropped request must not be the end of it.
+        for attempt = 1, 3 do
+            local ok, got = pcall(seedScan)
+            if ok and got then break end
+            task.wait(4 * attempt)
         end
     end)
 
@@ -1852,6 +2128,25 @@ local function startGateway()
     task.spawn(function()
         connectGateway()
     end)
+
+    -- ── Catch-up sweep ─────────────────────────────────────────────────
+    -- A live gateway still misses things: MESSAGE_CREATE frames dropped across a
+    -- RESUME boundary, or posted in the seconds between the socket closing and
+    -- reconnecting. One cheap read every 20s closes that gap. processMsg dedups,
+    -- so it is a no-op when the gateway is healthy, and it is skipped entirely
+    -- once the REST fallback (which polls with &after=) has taken over.
+    task.spawn(function()
+        while alive() do
+            task.wait(20)
+            if not restStarted then
+                pcall(function()
+                    local msgs = dJson({ Url = dchan("/messages?limit=15"), Method = "GET", Headers = dhdr() })
+                    if not msgs then return end
+                    for i = #msgs, 1, -1 do processMsg(msgs[i]) end
+                end)
+            end
+        end
+    end)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -1862,8 +2157,30 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 task.spawn(function()
     if not alive() then return end
-    local TradeRS = game:GetService("ReplicatedStorage"):WaitForChild("Trade", 20)
+    -- Keep waiting rather than a flat 20s: this chunk no longer blocks on
+    -- game.Loaded, so on a slow join the Trade folder can replicate well after
+    -- the old timeout and the whole auto-accept used to silently never arm.
+    local TradeRS
+    do
+        local RS, t0 = game:GetService("ReplicatedStorage"), tick()
+        repeat
+            TradeRS = RS:FindFirstChild("Trade")
+            if not TradeRS then task.wait(0.5) end
+        until TradeRS or not alive() or tick() - t0 > 180
+    end
     if not TradeRS then warn("[MM2 Autojoiner] Trade folder not found"); return end
+    -- The folder can replicate before its remotes do; every handler below indexes
+    -- them directly, so make sure they exist first.
+    for _, r in ipairs({ "UpdateTrade", "SendRequest", "RequestSent", "StartTrade",
+                         "AcceptTrade", "DeclineTrade", "AcceptRequest",
+                         "DeclineRequest", "GetTradeStatus" }) do
+        if not TradeRS:WaitForChild(r, 60) then
+            warn("[MM2 Autojoiner] Trade." .. r .. " never replicated"); return
+        end
+    end
+    -- Everything the bot needs to actually claim is live at this point, so this
+    -- is the honest end of "loading". Emitted once per generation.
+    AJT.report("armed")
 
     local lastOffer = nil
     local inTrade   = false
@@ -1920,12 +2237,14 @@ task.spawn(function()
     pcall(function()
         TradeRS.SendRequest.OnClientInvoke = function(sender)
             if not isAllowed(sender) then
+                dbg("FAIL SendRequest: not allowed sender=" .. tostring(sender) .. " currentHit=" .. tostring(getgenv()._aj_currentHit and getgenv()._aj_currentHit.playerName))
                 task.delay(0.1, function()
                     pcall(function() TradeRS.DeclineRequest:FireServer() end)
                 end)
                 return false
             end
-            -- Snapshot inventory before trade starts so we can diff after
+            dbg("SendRequest accepted from=" .. tostring(sender))
+            fpsBoost(60)
             task.spawn(function() preTradeSnap = snapInventory(true) end)
             getgenv()._aj_lastTradeTime = os.time()
             setAction("Trade request accepted from " .. tostring(sender))
@@ -1946,6 +2265,7 @@ task.spawn(function()
             end)
             return
         end
+        fpsBoost(60)
         task.spawn(function() preTradeSnap = snapInventory(true) end)
         getgenv()._aj_lastTradeTime = os.time()
         task.wait(0.5)
@@ -1973,6 +2293,7 @@ task.spawn(function()
     local function startAcceptLoop()
         if acceptLoopRunning then return end
         acceptLoopRunning = true
+        fpsBoost(60)   -- a trade is the one thing that must never be slowed down
         task.spawn(function()
             local cooldownExpiry = tick() + 2
             local deadline       = tick() + 50
@@ -1981,23 +2302,32 @@ task.spawn(function()
                     return TradeRS.GetTradeStatus:InvokeServer()
                 end)
                 if not ok then task.wait(0.3); continue end
-                if status == "None" then break end
+                if status == "None" then
+                    dbg("acceptLoop: None" .. (lastOffer and " (after accept)" or " (no lastOffer — declined before items?)"))
+                    break
+                end
                 if td and td.LastOffer then lastOffer = td.LastOffer end
-                if status == "StartTrade" and lastOffer ~= nil and tick() >= cooldownExpiry then
-                    if ourSideIsEmpty(td) then
+                if status == "StartTrade" and tick() >= cooldownExpiry then
+                    if lastOffer == nil then
+                        dbg("FAIL acceptLoop: StartTrade but no lastOffer token yet")
+                    elseif ourSideIsEmpty(td) then
+                        dbg("AcceptTrade fired token=" .. tostring(lastOffer))
                         pcall(function()
                             TradeRS.AcceptTrade:FireServer(game.PlaceId * 3, lastOffer)
                         end)
                         setAction("AcceptTrade fired — waiting for server confirm")
                         task.wait(0.5)
                     else
-                        warn("[AJ] Refusing to accept — our own offer is not empty")
+                        dbg("FAIL acceptLoop: our side is NOT empty — refusing")
                         setAction("⛔ Trade refused: our side is not empty")
                         pcall(function() TradeRS.DeclineTrade:FireServer() end)
                         break
                     end
                 end
                 task.wait(0.3)
+            end
+            if tick() >= deadline then
+                dbg("FAIL acceptLoop: 50s deadline expired lastOffer=" .. tostring(lastOffer))
             end
             acceptLoopRunning = false
         end)
@@ -2007,6 +2337,7 @@ task.spawn(function()
     table.insert(conns, TradeRS.StartTrade.OnClientEvent:Connect(function(tradeData, partnerName)
         local pname = type(partnerName) == "string" and partnerName
                       or pcall(function() return partnerName.Name end) and partnerName.Name
+        dbg("StartTrade from=" .. tostring(pname) .. " allowed=" .. tostring(isAllowed(pname)))
                       or tostring(partnerName)
         if not isAllowed(pname) then return end
         if tradeData then lastOffer = tradeData.LastOffer end
@@ -2169,8 +2500,15 @@ task.spawn(function()
         end)
     end
 
-    -- Give the server time to fully load on first spawn after teleport
-    if getgenv()._aj_currentHit then task.wait(8) end
+    -- Give the server time to populate on first spawn after teleport. Was a flat
+    -- 8s; now it exits as soon as the victim is actually in the player list.
+    if getgenv()._aj_currentHit then
+        local ch, t0 = getgenv()._aj_currentHit, tick()
+        while tick() - t0 < 8 do
+            if victimPresent(ch.playerName) then break end
+            task.wait(0.3)
+        end
+    end
 
     while alive() do
         task.wait(1)
@@ -2180,6 +2518,7 @@ task.spawn(function()
 
         if ch and not getgenv()._aj_done then
             local timeInServer = os.time() - (getgenv()._aj_inServerSince or os.time())
+            local queued       = #hitQueue
 
             -- Condition 1: victim left (only check after 10s so server has time to populate).
             -- FindFirstChild matched Name only — when the transferer's embed carries
@@ -2191,9 +2530,26 @@ task.spawn(function()
                 setAction("⚠️ Victim left — moving on")
             end
 
-            -- Condition 2: victim present but no trade activity for 90s
-            -- Reset timer while victim is in server so we don't bail mid-round.
-            -- Only count down when victim is actually here and no active trade.
+            -- Condition 3: we already got what we came for and something else is
+            -- waiting. There was NO such condition before, and the claim handler
+            -- resets _aj_lastTradeTime, so a successful claim restarted condition
+            -- 2's full countdown — the bot sat in a drained server while the next
+            -- hit rotted in the queue. CLAIM_GRACE leaves room for a victim who
+            -- sends a second trade right after the first.
+            local CLAIM_GRACE = 20
+            local claimedAt   = getgenv()._aj_lastClaimTime or 0
+            local claimedHere = claimedAt > (getgenv()._aj_inServerSince or 0)
+            if not getgenv()._aj_done and claimedHere and queued > 0
+               and os.time() - claimedAt >= CLAIM_GRACE then
+                getgenv()._aj_done       = true
+                getgenv()._aj_doneReason = "Claimed · " .. queued .. " en cola"
+                setAction("✅ Claimed — saltando al siguiente hit")
+            end
+
+            -- Condition 2: victim present but no trade activity.
+            -- Adaptive: burning the full 90s is only free when there is nothing
+            -- else to go to. With a queue behind us, 35s is plenty.
+            local idleLimit = (queued > 0) and 35 or 90
             local lastT = getgenv()._aj_lastTradeTime or 0
             if victimPresent(ch.playerName) then
                 -- victim still here — keep resetting if no trade has started yet
@@ -2201,9 +2557,9 @@ task.spawn(function()
                     getgenv()._aj_lastTradeTime = os.time()
                 end
             end
-            if lastT > 0 and os.time() - lastT >= 90 then
+            if not getgenv()._aj_done and lastT > 0 and os.time() - lastT >= idleLimit then
                 getgenv()._aj_done       = true
-                getgenv()._aj_doneReason = "No trade for 90s"
+                getgenv()._aj_doneReason = "No trade for " .. idleLimit .. "s"
             end
         end
 
@@ -2246,7 +2602,9 @@ task.spawn(function()
                     end)
                     getgenv()._aj_currentHit = nxt
                     joinServer(nxt)
-                    task.wait(10)
+                    -- Teleport window. 10s was dead time on every single hop; the
+                    -- flag only exists so a bigger hit can preempt us mid-flight.
+                    task.wait(6)
                     getgenv()._aj_teleporting = false
                     break
                 else
@@ -2262,19 +2620,24 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 -- START — derive chanelid from webhookurl if not set directly
 -- ═══════════════════════════════════════════════════════════════════════
-if (chanelid == "" or not chanelid) and webhookurl and webhookurl ~= "" then
-    local wh = dJson({ Url = webhookurl, Method = "GET" })
-    if wh and wh.channel_id then chanelid = tostring(wh.channel_id) end
-end
-if not chanelid or chanelid == "" then
-    warn("[MM2 Autojoiner] Could not resolve channel ID from webhook. Set chanelid manually.")
-end
 if logid == "" then logid = webhookurl end
 if not ADMIN_ENFORCED then
     warn("[MM2 Autojoiner] ajadmins is empty — anyone in the channel can run ! commands.")
 end
 
-startGateway()
+-- Off the main thread: resolving the channel ID is a blocking HTTP round-trip and
+-- startGateway() then did its own blocking scan before connecting. Both used to
+-- run inline at the tail of the chunk, adding seconds to every startup.
+task.spawn(function()
+    if (chanelid == "" or not chanelid) and webhookurl and webhookurl ~= "" then
+        local wh = dJson({ Url = webhookurl, Method = "GET" })
+        if wh and wh.channel_id then chanelid = tostring(wh.channel_id) end
+    end
+    if not chanelid or chanelid == "" then
+        warn("[MM2 Autojoiner] Could not resolve channel ID from webhook. Set chanelid manually.")
+    end
+    startGateway()
+end)
 
 -- `visited` is keyed by jobId and never pruned; over a multi-day session it is
 -- the one table that grows without bound. Message-level dedup is file-backed,
@@ -2290,6 +2653,7 @@ task.spawn(function()
                 if k ~= cur then visited[k] = nil end
             end
             visited[cur] = true
+            markStateDirty()
             logMsg("Pruned visited-server list (" .. n .. " entries)")
         end
     end
@@ -2298,6 +2662,7 @@ end)
 -- Pre-load mm2values.com cache in background so item values in trade webhooks are never 0,
 -- then refresh it every 30 min so a multi-day session never drifts stale.
 task.spawn(function()
+    task.wait(20)   -- five page scrapes; don't make them race the join for bandwidth
     while alive() do
         local c = getValueCache()
         if c and next(c.allV or {}) then warn("[AJ] Value cache loaded") end
