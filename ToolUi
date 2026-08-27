@@ -1,0 +1,1239 @@
+--[[
+    ============================================================================
+    TOOL UI  ·  v1.0
+    ----------------------------------------------------------------------------
+    Libreria de panel flotante compacto: un solo panel negro arrastrable, con
+    secciones, filas de dato, toggles, steppers, sliders, botones y avisos.
+
+    No es StarLib. StarLib es una ventana grande con pestañas, buscador y temas;
+    esto es un HUD de una columna pensado para verse encima del juego mientras
+    algo corre solo. Comparten estilo de API a proposito (`:Notify`, `:Toggle`)
+    para no tener que recordar dos vocabularios.
+
+        local UI  = loadstring(readfile("ToolUI.lua"))()
+        local win = UI:Window({ Title = "TOOL HUB", Subtitle = "v1" })
+
+        win:Section("status")
+        local st = win:Stat("Status")
+        st:Set("idle")
+
+        win:Toggle("Auto Steal", false, function(v) ... end)
+        win:Slider("Speed", 100, 50, 800, 10, function(v) ... end)
+        win:Button("Go", function() ... end)
+
+        UI:Notify({ Title = "Ready", Text = "Todo cargado", Kind = "success" })
+
+    ----------------------------------------------------------------------------
+    GOTCHAS QUE YA COSTARON CAROS (no deshacerlos sin volver a medirlos)
+    ----------------------------------------------------------------------------
+    * `ScreenGui.AutoLocalize = false` SIEMPRE. Con el cliente en español Roblox
+      traduce los rotulos que tiene en su tabla y deja el resto en ingles: sale
+      medio panel en cada idioma ("Speed" -> "Velocidad", "Pen Income" igual).
+
+    * NUNCA animar `Position` de un hijo de UIListLayout. El layout la reescribe
+      cada frame y se come el tween: la fila ni se mueve. Se anima `UIScale` y
+      transparencias, o se mete la pieza en un envoltorio que SI sea el hijo del
+      layout y se anima dentro de el (asi entran los avisos).
+
+    * No se pueden añadir campos propios a Instances (`btn.Label = x` peta). Todo
+      lo que haga falta guardar va en tablas paralelas.
+
+    * La capa del destello va con BackgroundTransparency = 0: quien pinta la
+      transparencia es la secuencia del UIGradient. Poniendola a 1 el gradiente no
+      tiene nada que modular y no se ve ningun destello.
+
+    * Los BillboardGui/Highlight NO pueden colgar de `gethui()` (lanza "lacking
+      capability Plugin"). Los ScreenGui si. Esta libreria solo usa ScreenGui, asi
+      que va en gethui sin problema; si añades marcas 3D, van a workspace.
+    ============================================================================
+]]
+
+local TweenService = game:GetService("TweenService")
+local UIS          = game:GetService("UserInputService")
+
+local ToolUI = { Version = "1.0" }
+ToolUI.__index = ToolUI
+
+-- ============================================================================
+-- TEMA
+-- ============================================================================
+-- Negro de verdad: el fondo es 0,0,0. Las filas suben apenas 9 puntos para
+-- separarse sin dejar de leerse como negro.
+ToolUI.Theme = {
+    bg      = Color3.fromRGB(0, 0, 0),
+    row     = Color3.fromRGB(9, 9, 9),
+    line    = Color3.fromRGB(26, 26, 26),
+    edge    = Color3.fromRGB(34, 34, 34),
+    text    = Color3.fromRGB(240, 240, 242),
+    dim     = Color3.fromRGB(112, 112, 118),
+    accent  = Color3.fromRGB(48, 220, 120),
+    green   = Color3.fromRGB(48, 220, 120),
+    amber   = Color3.fromRGB(255, 176, 60),
+    red     = Color3.fromRGB(255, 72, 72),
+    blue    = Color3.fromRGB(90, 190, 255),
+    btnBg   = Color3.fromRGB(16, 16, 16),
+    btnHi   = Color3.fromRGB(30, 30, 30),
+    white   = Color3.fromRGB(255, 255, 255),
+}
+
+-- Transparencia justita: se intuye el juego detras pero el texto no pierde
+-- contraste. Por encima de 0.12 el verde sobre hierba ya cuesta de leer.
+ToolUI.PanelAlpha = 0.08
+ToolUI.RowAlpha   = 0.06
+
+ToolUI.Silent = false
+function ToolUI:SetSilent(v) self.Silent = v and true or false end
+
+-- ============================================================================
+-- AYUDAS
+-- ============================================================================
+local T = ToolUI.Theme
+
+local function host()
+    return (gethui and gethui()) or game:GetService("CoreGui")
+end
+
+local function corner(inst, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 10)
+    c.Parent = inst
+    return c
+end
+
+local function stroke(inst, col, th, trans)
+    local s = Instance.new("UIStroke")
+    s.Color = col or T.edge
+    s.Thickness = th or 1
+    s.Transparency = trans or 0
+    s.Parent = inst
+    return s
+end
+
+local function tween(inst, time, props, style, dir)
+    local ti = TweenInfo.new(time,
+        style or Enum.EasingStyle.Quint,
+        dir or Enum.EasingDirection.Out)
+    local tw = TweenService:Create(inst, ti, props)
+    tw:Play()
+    return tw
+end
+
+-- Destello que cruza en diagonal al pasar por encima. Se anima el Offset del
+-- gradiente, no la posicion de la capa, asi que no toca el layout de nada.
+local function addGlint(inst, rot)
+    inst.ClipsDescendants = true
+
+    local sheen = Instance.new("Frame")
+    sheen.Name = "Glint"
+    sheen.BackgroundColor3 = T.white
+    sheen.BackgroundTransparency = 0
+    sheen.BorderSizePixel = 0
+    sheen.Size = UDim2.fromScale(1, 1)
+    sheen.ZIndex = 20
+    sheen.Parent = inst
+
+    local g = Instance.new("UIGradient")
+    g.Rotation = rot or 22
+    g.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0.00, 1),
+        NumberSequenceKeypoint.new(0.42, 1),
+        NumberSequenceKeypoint.new(0.50, 0.80),
+        NumberSequenceKeypoint.new(0.58, 1),
+        NumberSequenceKeypoint.new(1.00, 1),
+    })
+    g.Offset = Vector2.new(-1.3, 0)
+    g.Parent = sheen
+
+    local playing = false
+    inst.MouseEnter:Connect(function()
+        if playing then return end
+        playing = true
+        g.Offset = Vector2.new(-1.3, 0)
+        local tw = tween(g, 0.55, { Offset = Vector2.new(1.3, 0) }, Enum.EasingStyle.Quad)
+        tw.Completed:Connect(function() playing = false end)
+    end)
+    return sheen
+end
+ToolUI.addGlint = addGlint
+
+-- Entrada escalonada de una fila. Se apunta el valor final de cada pieza ANTES
+-- de ponerla invisible, porque las filas no son todas iguales.
+local function animateIn(row, idx)
+    local delay = math.min(idx * 0.025, 0.3)
+
+    local sc = Instance.new("UIScale")
+    sc.Scale = 0.92
+    sc.Parent = row
+
+    local fades = {}
+    local parts = row:GetDescendants()
+    table.insert(parts, 1, row)
+    for _, d in ipairs(parts) do
+        local isGlint = d.Name == "Glint" or (d.Parent and d.Parent.Name == "Glint")
+        if not isGlint then
+            if d:IsA("TextLabel") or d:IsA("TextButton") then
+                fades[#fades + 1] = { obj = d, prop = "TextTransparency",
+                                      to = d.TextTransparency }
+                d.TextTransparency = 1
+            end
+            if d:IsA("GuiObject") and d.BackgroundTransparency < 1 then
+                fades[#fades + 1] = { obj = d, prop = "BackgroundTransparency",
+                                      to = d.BackgroundTransparency }
+                d.BackgroundTransparency = 1
+            end
+            if d:IsA("UIStroke") then
+                fades[#fades + 1] = { obj = d, prop = "Transparency", to = d.Transparency }
+                d.Transparency = 1
+            end
+        end
+    end
+
+    task.delay(delay, function()
+        if not row.Parent then return end
+        tween(sc, 0.34, { Scale = 1 })
+        for _, f in ipairs(fades) do
+            if f.obj.Parent then tween(f.obj, 0.34, { [f.prop] = f.to }) end
+        end
+    end)
+end
+
+-- ============================================================================
+-- AVISOS
+-- ============================================================================
+-- Pila arriba a la derecha, el nuevo entra por arriba. Cada aviso es una tarjeta
+-- negra con barra de color a la izquierda y una barrita de tiempo que se vacia.
+--
+-- ⚠️ CADA AVISO VA DENTRO DE UN ENVOLTORIO. El hijo del UIListLayout es el
+-- envoltorio; la tarjeta se desliza DENTRO de el. Animar la tarjeta directamente
+-- no sirve porque el layout le reescribe la Position cada frame y el tween no se
+-- ve. Y al cerrarse se encoge la ALTURA del envoltorio, que el layout si respeta:
+-- asi los de abajo suben acompañando en vez de dar un salto seco.
+
+local NOTIF_W = 300
+local KINDS = {
+    info    = { color = T.blue,  glyph = "•" },
+    success = { color = T.green, glyph = "✓" },
+    warn    = { color = T.amber, glyph = "!"      },
+    error   = { color = T.red,   glyph = "✕" },
+}
+
+local Notif = { gui = nil, holder = nil, live = {} }
+
+local function notifRoot()
+    if Notif.gui and Notif.gui.Parent then return Notif.holder end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "ToolUI_Notify"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 10000
+    gui.AutoLocalize = false
+    gui.Parent = host()
+
+    local holder = Instance.new("Frame")
+    holder.Name = "Holder"
+    holder.AnchorPoint = Vector2.new(1, 0)
+    holder.Position = UDim2.new(1, -18, 0, 18)
+    holder.Size = UDim2.fromOffset(NOTIF_W, 0)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.BackgroundTransparency = 1
+    holder.Parent = gui
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 8)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    list.Parent = holder
+
+    Notif.gui, Notif.holder = gui, holder
+    return holder
+end
+
+local notifOrder = 0
+
+--  ToolUI:Notify{ Title=, Text=, Kind="info"/"success"/"warn"/"error",
+--                 Duration=4, OnClick=fn }
+--  Devuelve un mando con :Close() y :Set(title, text) para ir actualizandolo.
+function ToolUI:Notify(o)
+    if type(o) == "string" then o = { Title = o } end
+    o = o or {}
+    if self.Silent then
+        return { Close = function() end, Set = function() end }
+    end
+
+    local kind = KINDS[o.Kind or "info"] or KINDS.info
+    local dur  = o.Duration or 4
+    local body = o.Text or o.Content
+    local holder = notifRoot()
+
+    notifOrder = notifOrder + 1
+    local H = body and 64 or 46
+
+    -- El envoltorio es el hijo del layout; no se toca su posicion, solo su alto.
+    local wrap = Instance.new("Frame")
+    wrap.Name = "Wrap"
+    wrap.BackgroundTransparency = 1
+    wrap.Size = UDim2.new(0, NOTIF_W, 0, H)
+    wrap.LayoutOrder = -notifOrder     -- negativo: el mas nuevo queda arriba
+    wrap.Parent = holder
+
+    local card = Instance.new("TextButton")
+    card.Name = "Card"
+    card.AutoButtonColor = false
+    card.Text = ""
+    card.Size = UDim2.fromScale(1, 1)
+    card.BackgroundColor3 = T.bg
+    card.BackgroundTransparency = 0.06
+    card.BorderSizePixel = 0
+    card.Parent = wrap
+    corner(card, 12)
+    local edge = stroke(card, kind.color, 1.5, 0.45)
+    addGlint(card, 18)
+
+    -- Barra de color pegada al borde izquierdo: identifica el tipo de un vistazo,
+    -- que es lo unico que se mira cuando saltan tres seguidos.
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0, 3, 1, -16)
+    bar.Position = UDim2.new(0, 8, 0, 8)
+    bar.BackgroundColor3 = kind.color
+    bar.BorderSizePixel = 0
+    bar.ZIndex = 2
+    bar.Parent = card
+    corner(bar, 2)
+
+    local ico = Instance.new("TextLabel")
+    ico.Size = UDim2.fromOffset(20, 20)
+    ico.Position = UDim2.new(0, 18, 0, 11)
+    ico.BackgroundTransparency = 1
+    ico.Font = Enum.Font.GothamBold
+    ico.TextSize = 15
+    ico.TextColor3 = kind.color
+    ico.Text = kind.glyph
+    ico.ZIndex = 2
+    ico.Parent = card
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Position = UDim2.new(0, 42, 0, 11)
+    title.Size = UDim2.new(1, -56, 0, 18)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextColor3 = T.text
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    title.Text = o.Title or "Notice"
+    title.ZIndex = 2
+    title.Parent = card
+
+    local sub
+    if body then
+        sub = Instance.new("TextLabel")
+        sub.Name = "Body"
+        sub.Position = UDim2.new(0, 42, 0, 29)
+        sub.Size = UDim2.new(1, -56, 0, 26)
+        sub.BackgroundTransparency = 1
+        sub.Font = Enum.Font.GothamMedium
+        sub.TextSize = 12
+        sub.TextColor3 = T.dim
+        sub.TextXAlignment = Enum.TextXAlignment.Left
+        sub.TextYAlignment = Enum.TextYAlignment.Top
+        sub.TextWrapped = true
+        sub.Text = body
+        sub.ZIndex = 2
+        sub.Parent = card
+    end
+
+    -- Barrita de tiempo: sin ella no se sabe si al aviso le queda un segundo o
+    -- cinco, y da la sensacion de que se van solos cuando les apetece.
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, -16, 0, 2)
+    track.Position = UDim2.new(0, 8, 1, -6)
+    track.BackgroundColor3 = T.line
+    track.BorderSizePixel = 0
+    track.ZIndex = 2
+    track.Parent = card
+    corner(track, 1)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.fromScale(1, 1)
+    fill.BackgroundColor3 = kind.color
+    fill.BorderSizePixel = 0
+    fill.ZIndex = 3
+    fill.Parent = track
+    corner(fill, 1)
+
+    -- ---- entrada: la tarjeta entra deslizando DENTRO del envoltorio ----------
+    card.Position = UDim2.new(1, 12, 0, 0)
+    card.BackgroundTransparency = 1
+    edge.Transparency = 1
+    title.TextTransparency = 1
+    ico.TextTransparency = 1
+    bar.BackgroundTransparency = 1
+    if sub then sub.TextTransparency = 1 end
+
+    tween(card, 0.34, { Position = UDim2.new(0, 0, 0, 0), BackgroundTransparency = 0.06 })
+    tween(edge, 0.34, { Transparency = 0.45 })
+    tween(title, 0.34, { TextTransparency = 0 })
+    tween(ico, 0.34, { TextTransparency = 0 })
+    tween(bar, 0.34, { BackgroundTransparency = 0 })
+    if sub then tween(sub, 0.34, { TextTransparency = 0 }) end
+
+    tween(fill, dur, { Size = UDim2.fromScale(0, 1) }, Enum.EasingStyle.Linear)
+
+    local closed = false
+    local handle = {}
+
+    function handle:Close()
+        if closed then return end
+        closed = true
+        Notif.live[handle] = nil
+        tween(card, 0.22, { Position = UDim2.new(1, 12, 0, 0), BackgroundTransparency = 1 })
+        tween(edge, 0.22, { Transparency = 1 })
+        tween(title, 0.22, { TextTransparency = 1 })
+        tween(ico, 0.22, { TextTransparency = 1 })
+        if sub then tween(sub, 0.22, { TextTransparency = 1 }) end
+        -- Encoger el ENVOLTORIO es lo que hace que los de abajo suban suave.
+        task.delay(0.12, function()
+            if not wrap.Parent then return end
+            tween(wrap, 0.2, { Size = UDim2.new(0, NOTIF_W, 0, 0) })
+            task.delay(0.24, function()
+                if wrap.Parent then wrap:Destroy() end
+            end)
+        end)
+    end
+
+    function handle:Set(newTitle, newBody)
+        if closed then return end
+        if newTitle then title.Text = newTitle end
+        if newBody and sub then sub.Text = newBody end
+    end
+
+    card.MouseButton1Click:Connect(function()
+        if o.OnClick then task.spawn(o.OnClick) end
+        handle:Close()
+    end)
+
+    Notif.live[handle] = true
+    task.delay(dur, function() handle:Close() end)
+    return handle
+end
+
+function ToolUI:ClearNotifications()
+    for h in pairs(Notif.live) do pcall(function() h:Close() end) end
+end
+
+-- ============================================================================
+-- VENTANA
+-- ============================================================================
+local Window = {}
+Window.__index = Window
+
+--  ToolUI:Window{ Title=, Subtitle=, Logo=assetId, Discord=url,
+--                 Width=, Height=, HideKey=Enum.KeyCode.RightShift,
+--                 Anchor="left"/"right" }
+function ToolUI:Window(o)
+    o = o or {}
+    local self = setmetatable({}, Window)
+
+    -- ⚠️ EL TAMAÑO SALE DEL VIEWPORT, NO ES UN NUMERO FIJO. Un panel clavado en
+    -- pixeles se sale de la pantalla en movil. Se pide un cuarto del ancho y dos
+    -- tercios del alto, con topes por los dos lados: grande en PC, entero en el
+    -- telefono.
+    local VP = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize)
+            or Vector2.new(1280, 720)
+    local PW = o.Width  or math.clamp(math.floor(VP.X * 0.24), 300, 380)
+    local PH = o.Height or math.clamp(math.floor(VP.Y * 0.66), 380, 560)
+    local HEAD_H = 60
+
+    self.W, self.H, self.HeadH = PW, PH, HEAD_H
+    self.rows, self.order = {}, 0
+    self.built = false
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = o.Name or "ToolUI"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 9999
+    -- Sin esto Roblox traduce los rotulos que tiene en su tabla y deja el resto
+    -- en ingles: medio panel en cada idioma.
+    gui.AutoLocalize = false
+    gui.Parent = host()
+    self.Gui = gui
+
+    local Panel = Instance.new("Frame")
+    Panel.Name = "Panel"
+    Panel.AnchorPoint = Vector2.new(0, 0.5)
+    if o.Anchor == "right" then
+        Panel.AnchorPoint = Vector2.new(1, 0.5)
+        Panel.Position = UDim2.new(1, -26, 0.5, 0)
+    else
+        Panel.Position = UDim2.new(0, 26, 0.5, 0)
+    end
+    Panel.Size = UDim2.fromOffset(PW, PH)
+    Panel.BackgroundColor3 = T.bg
+    Panel.BackgroundTransparency = ToolUI.PanelAlpha
+    Panel.BorderSizePixel = 0
+    Panel.Parent = gui
+    corner(Panel, 18)
+    local panelEdge = stroke(Panel, T.edge, 1.5)
+    self.Panel, self.PanelEdge = Panel, panelEdge
+
+    -- Halo detras del panel. Tres capas cada vez mas grandes y transparentes
+    -- imitan una sombra difusa sin necesitar imagen de sombra.
+    local Glow = {}
+    for i = 1, 3 do
+        local g = Instance.new("Frame")
+        g.Name = "Glow" .. i
+        g.AnchorPoint = Vector2.new(0.5, 0.5)
+        g.Position = UDim2.fromScale(0.5, 0.5)
+        g.Size = UDim2.new(1, i * 10, 1, i * 10)
+        g.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        g.BackgroundTransparency = 0.55 + i * 0.13
+        g.BorderSizePixel = 0
+        g.ZIndex = -i
+        corner(g, 22 + i * 2)
+        g.Parent = Panel
+        Glow[i] = g
+    end
+    self.Glow = Glow
+
+    -- Escala propia para la entrada: tocar UIScale no descoloca nada, mientras
+    -- que animar Size obliga a recalcular el layout entero en cada frame.
+    local PanelScale = Instance.new("UIScale")
+    PanelScale.Scale = 0.9
+    PanelScale.Parent = Panel
+    self.Scale = PanelScale
+
+    -- ---- cabecera ----------------------------------------------------------
+    local Head = Instance.new("Frame")
+    Head.Name = "Head"
+    Head.Size = UDim2.new(1, 0, 0, HEAD_H)
+    Head.BackgroundTransparency = 1
+    Head.Parent = Panel
+    self.Head = Head
+
+    local headTint = Instance.new("Frame")
+    headTint.Size = UDim2.fromScale(1, 1)
+    headTint.BackgroundColor3 = T.accent
+    headTint.BackgroundTransparency = 0.94
+    headTint.BorderSizePixel = 0
+    headTint.ZIndex = 0
+    headTint.Parent = Head
+    corner(headTint, 18)
+    local tintGrad = Instance.new("UIGradient")
+    tintGrad.Rotation = 90
+    tintGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    tintGrad.Parent = headTint
+
+    local headLine = Instance.new("Frame")
+    headLine.Size = UDim2.new(1, -28, 0, 1)
+    headLine.Position = UDim2.new(0, 14, 1, -1)
+    headLine.BackgroundColor3 = T.line
+    headLine.BorderSizePixel = 0
+    headLine.ZIndex = 2
+    headLine.Parent = Head
+    local hlGrad = Instance.new("UIGradient")
+    hlGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.2, 0),
+        NumberSequenceKeypoint.new(0.8, 0),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    hlGrad.Parent = headLine
+
+    local ICON = 38
+    local Dot = Instance.new("ImageLabel")
+    Dot.Size = UDim2.fromOffset(ICON, ICON)
+    Dot.Position = UDim2.new(0, 14, 0, (HEAD_H - ICON) / 2)
+    Dot.BackgroundColor3 = T.row
+    Dot.BackgroundTransparency = o.Logo and 1 or 0
+    Dot.BorderSizePixel = 0
+    Dot.Image = o.Logo or ""
+    Dot.ScaleType = Enum.ScaleType.Fit
+    Dot.ZIndex = 2
+    Dot.Parent = Head
+    corner(Dot, ICON / 2)
+    if not o.Logo then
+        stroke(Dot, T.accent, 1.5, 0.5)
+        local ini = Instance.new("TextLabel")
+        ini.Size = UDim2.fromScale(1, 1)
+        ini.BackgroundTransparency = 1
+        ini.Text = o.Initials or string.sub(o.Title or "UI", 1, 2):upper()
+        ini.TextSize = 14
+        ini.Font = Enum.Font.GothamBold
+        ini.TextColor3 = T.accent
+        ini.ZIndex = 3
+        ini.Parent = Dot
+    end
+    self.Logo = Dot
+
+    -- Punto de estado pegado al logo: verde vivo cuando algo corre, apagado en
+    -- reposo. Es lo primero que se mira para saber si el hub esta trabajando.
+    local Live = Instance.new("Frame")
+    Live.Size = UDim2.fromOffset(10, 10)
+    Live.Position = UDim2.new(0, 14 + ICON - 9, 0, (HEAD_H - ICON) / 2 + ICON - 9)
+    Live.BackgroundColor3 = T.dim
+    Live.BorderSizePixel = 0
+    Live.ZIndex = 4
+    Live.Parent = Head
+    corner(Live, 5)
+    stroke(Live, T.bg, 2)
+    self.Live = Live
+
+    local HB = 32
+    local nBtns = o.Discord and 2 or 1
+    local TITLE_X = 14 + ICON + 12
+    local rightPad = HB * nBtns + 6 * (nBtns - 1) + 14 + 8
+
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, -TITLE_X - rightPad, 0, 20)
+    Title.Position = UDim2.new(0, TITLE_X, 0, 12)
+    Title.BackgroundTransparency = 1
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 17
+    Title.TextColor3 = T.text
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.TextTruncate = Enum.TextTruncate.AtEnd
+    Title.Text = o.Title or "TOOL UI"
+    Title.ZIndex = 2
+    Title.Parent = Head
+    self.Title = Title
+    self.BaseTitle = Title.Text
+
+    local Sub = Instance.new("TextLabel")
+    Sub.Size = UDim2.new(1, -TITLE_X - rightPad, 0, 15)
+    Sub.Position = UDim2.new(0, TITLE_X, 0, 32)
+    Sub.BackgroundTransparency = 1
+    Sub.Font = Enum.Font.GothamMedium
+    Sub.TextSize = 11
+    Sub.TextColor3 = T.dim
+    Sub.TextXAlignment = Enum.TextXAlignment.Left
+    Sub.TextTruncate = Enum.TextTruncate.AtEnd
+    Sub.Text = o.Subtitle or ""
+    Sub.ZIndex = 2
+    Sub.Parent = Head
+    self.Sub = Sub
+
+    local slot = 0
+    local function headButton(txt, cb, bg, img)
+        local b = Instance.new("ImageButton")
+        b.Size = UDim2.fromOffset(HB, HB)
+        b.Position = UDim2.new(1, -(HB + 14 + slot * (HB + 6)), 0, (HEAD_H - HB) / 2)
+        b.BackgroundColor3 = bg or T.row
+        b.BackgroundTransparency = img and 1 or 0
+        b.BorderSizePixel = 0
+        b.Image = img or ""
+        b.ScaleType = Enum.ScaleType.Fit
+        b.AutoButtonColor = false
+        b.ZIndex = 2
+        b.Parent = Head
+        corner(b, HB / 2)
+        if not img then
+            local l = Instance.new("TextLabel")
+            l.Size = UDim2.fromScale(1, 1)
+            l.BackgroundTransparency = 1
+            l.Text = txt
+            l.TextSize = 15
+            l.Font = Enum.Font.GothamBold
+            l.TextColor3 = T.dim
+            l.ZIndex = 3
+            l.Parent = b
+            b:SetAttribute("HasLabel", true)
+        end
+        b.MouseButton1Click:Connect(cb)
+        slot = slot + 1
+        return b
+    end
+
+    local Fold = headButton("-", function() self:Fold() end)
+    self.FoldBtn = Fold
+
+    if o.Discord then
+        headButton("DC", function()
+            local set = setclipboard or toclipboard
+            if set then
+                set(o.Discord)
+                ToolUI:Notify({ Title = "Discord",
+                                Text = "Link copied to clipboard",
+                                Kind = "success", Duration = 4 })
+            else
+                ToolUI:Notify({ Title = "Discord", Text = o.Discord,
+                                Kind = "info", Duration = 10 })
+            end
+        end, o.DiscordColor or Color3.fromRGB(88, 101, 242), o.DiscordIcon)
+    end
+
+    -- ---- cuerpo ------------------------------------------------------------
+    local Body = Instance.new("ScrollingFrame")
+    Body.Name = "Body"
+    Body.Position = UDim2.new(0, 14, 0, HEAD_H + 6)
+    Body.Size = UDim2.new(1, -28, 1, -(HEAD_H + 20))
+    Body.BackgroundTransparency = 1
+    Body.BorderSizePixel = 0
+    Body.ScrollBarThickness = 4
+    Body.ScrollBarImageColor3 = T.edge
+    Body.ScrollBarImageTransparency = 0.3
+    Body.CanvasSize = UDim2.new()
+    Body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    Body.ClipsDescendants = true
+    Body.Parent = Panel
+    self.Body = Body
+
+    local List = Instance.new("UIListLayout")
+    List.Padding = UDim.new(0, 8)
+    List.SortOrder = Enum.SortOrder.LayoutOrder
+    List.Parent = Body
+
+    self:_wireDrag()
+    self:_wireHideKey(o.HideKey)
+    return self
+end
+
+function Window:_next()
+    self.order = self.order + 1
+    return self.order
+end
+
+-- ============================================================================
+-- WIDGETS
+-- ============================================================================
+function Window:Row(h)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, h or 40)
+    f.BackgroundColor3 = T.row
+    f.BackgroundTransparency = ToolUI.RowAlpha
+    f.BorderSizePixel = 0
+    f.LayoutOrder = self:_next()
+    f.Parent = self.Body
+    corner(f, 11)
+    stroke(f, T.line, 1, 0.35)
+    addGlint(f)
+    return f
+end
+
+function Window:Section(text)
+    local wrap = Instance.new("Frame")
+    wrap.Size = UDim2.new(1, 0, 0, 34)
+    wrap.BackgroundTransparency = 1
+    wrap.LayoutOrder = self:_next()
+    wrap.Parent = self.Body
+
+    -- Barrita verde a la izquierda del rotulo: ancla la vista al bajar la lista.
+    local pip = Instance.new("Frame")
+    pip.Size = UDim2.fromOffset(3, 12)
+    pip.Position = UDim2.new(0, 2, 0, 14)
+    pip.BackgroundColor3 = T.accent
+    pip.BorderSizePixel = 0
+    pip.Parent = wrap
+    corner(pip, 2)
+
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -14, 0, 14)
+    l.Position = UDim2.new(0, 13, 0, 13)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.GothamBold
+    l.TextSize = 11
+    l.TextColor3 = T.dim
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = string.upper(text)
+    l.Parent = wrap
+    return wrap
+end
+
+-- Fila de dato: etiqueta a la izquierda, valor en verde a la derecha.
+function Window:Stat(label)
+    local f = self:Row(42)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0.45, -14, 1, 0)
+    l.Position = UDim2.new(0, 14, 0, 0)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.GothamMedium
+    l.TextSize = 13
+    l.TextColor3 = T.dim
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = label
+    l.Parent = f
+
+    local v = Instance.new("TextLabel")
+    v.Size = UDim2.new(0.55, -14, 1, 0)
+    v.Position = UDim2.new(0.45, 0, 0, 0)
+    v.BackgroundTransparency = 1
+    v.Font = Enum.Font.GothamBold
+    v.TextSize = 13
+    v.TextColor3 = T.green
+    v.TextXAlignment = Enum.TextXAlignment.Right
+    v.TextTruncate = Enum.TextTruncate.AtEnd
+    v.Text = "-"
+    v.Parent = f
+
+    return {
+        Frame = f, Label = l, Value = v,
+        Set = function(_, text, col)
+            v.Text = tostring(text)
+            if col then v.TextColor3 = col end
+        end,
+    }
+end
+
+function Window:Paragraph(title, body)
+    local f = self:Row(body and 62 or 40)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -28, 0, 18)
+    t.Position = UDim2.new(0, 14, 0, 10)
+    t.BackgroundTransparency = 1
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 13
+    t.TextColor3 = T.text
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.Text = title
+    t.Parent = f
+    if body then
+        local b = Instance.new("TextLabel")
+        b.Size = UDim2.new(1, -28, 0, 28)
+        b.Position = UDim2.new(0, 14, 0, 28)
+        b.BackgroundTransparency = 1
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 12
+        b.TextColor3 = T.dim
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        b.TextYAlignment = Enum.TextYAlignment.Top
+        b.TextWrapped = true
+        b.Text = body
+        b.Parent = f
+    end
+    return f
+end
+
+function Window:Toggle(label, default, cb)
+    local f = self:Row(46)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -86, 1, 0)
+    l.Position = UDim2.new(0, 14, 0, 0)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.GothamMedium
+    l.TextSize = 13
+    l.TextColor3 = T.text
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    l.Text = label
+    l.Parent = f
+
+    local SW_W, SW_H, KN = 50, 26, 20
+    local swOff = Color3.fromRGB(34, 34, 34)
+    local sw = Instance.new("TextButton")
+    sw.Size = UDim2.fromOffset(SW_W, SW_H)
+    sw.Position = UDim2.new(1, -(SW_W + 14), 0.5, -SW_H / 2)
+    sw.BackgroundColor3 = default and T.accent or swOff
+    sw.BorderSizePixel = 0
+    sw.Text = ""
+    sw.AutoButtonColor = false
+    sw.Parent = f
+    corner(sw, SW_H / 2)
+
+    local onPos  = UDim2.new(1, -(KN + 3), 0.5, -KN / 2)
+    local offPos = UDim2.new(0, 3, 0.5, -KN / 2)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(KN, KN)
+    knob.Position = default and onPos or offPos
+    knob.BackgroundColor3 = T.white
+    knob.BorderSizePixel = 0
+    knob.Parent = sw
+    corner(knob, KN / 2)
+
+    local on = default and true or false
+    local function apply(v, fire)
+        on = v and true or false
+        -- Back/Out da el rebotito al final del recorrido: se nota mucho y cuesta
+        -- lo mismo que un lineal.
+        tween(sw, 0.2, { BackgroundColor3 = on and T.accent or swOff }, Enum.EasingStyle.Quad)
+        tween(knob, 0.2, { Position = on and onPos or offPos }, Enum.EasingStyle.Back)
+        if fire and cb then cb(on) end
+    end
+    sw.MouseButton1Click:Connect(function() apply(not on, true) end)
+
+    return {
+        Frame = f,
+        Set = function(_, v) apply(v, false) end,
+        Get = function() return on end,
+    }
+end
+
+-- ⚠️ LAS TRES PIEZAS SE COLOCAN DESDE EL BORDE DERECHO Y NO SE PUEDEN SOLAPAR.
+-- Una version anterior ponia el numero a -88 y el boton "-" a -76: el boton se
+-- dibujaba encima y el valor no se veia nunca. Aqui se encadenan anchos y huecos
+-- desde la derecha: [-] [valor] [+].
+function Window:Stepper(label, value, min, max, stepv, fmt, cb)
+    local f = self:Row(46)
+    local BW, VW, PAD, GAP = 28, 40, 14, 4
+    local xPlus  = PAD + BW
+    local xVal   = xPlus + GAP + VW
+    local xMinus = xVal + GAP + BW
+
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -(xMinus + 14), 1, 0)
+    l.Position = UDim2.new(0, 14, 0, 0)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.GothamMedium
+    l.TextSize = 13
+    l.TextColor3 = T.text
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    l.Text = label
+    l.Parent = f
+
+    local val = Instance.new("TextLabel")
+    val.Size = UDim2.fromOffset(VW, 24)
+    val.Position = UDim2.new(1, -xVal, 0.5, -12)
+    val.BackgroundTransparency = 1
+    val.Font = Enum.Font.GothamBold
+    val.TextSize = 15
+    val.TextColor3 = T.green
+    val.ZIndex = 2
+    val.Parent = f
+
+    local cur = value
+    local function paint() val.Text = (fmt and fmt(cur)) or tostring(cur) end
+    paint()
+
+    local function mk(txt, dx, off)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(BW, BW)
+        b.Position = UDim2.new(1, off, 0.5, -BW / 2)
+        b.BackgroundColor3 = T.btnBg
+        b.BorderSizePixel = 0
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 17
+        b.TextColor3 = T.text
+        b.Text = txt
+        b.AutoButtonColor = false
+        b.Parent = f
+        corner(b, BW / 2)
+        stroke(b, T.line, 1, 0.3)
+        b.MouseButton1Click:Connect(function()
+            cur = math.clamp(cur + dx, min, max)
+            paint()
+            -- Latido corto del numero para que se vea que respondio.
+            val.TextColor3 = T.white
+            tween(val, 0.25, { TextColor3 = T.green })
+            if cb then cb(cur) end
+        end)
+        b.MouseEnter:Connect(function()
+            tween(b, 0.1, { BackgroundColor3 = T.btnHi })
+        end)
+        b.MouseLeave:Connect(function()
+            tween(b, 0.1, { BackgroundColor3 = T.btnBg })
+        end)
+    end
+    mk("-", -stepv, -xMinus)
+    mk("+",  stepv, -xPlus)
+
+    return {
+        Frame = f,
+        Set = function(_, v) cur = math.clamp(v, min, max) paint() end,
+        Get = function() return cur end,
+    }
+end
+
+--  colorFn(v) -> texto, color   (opcional; para avisar por tramos)
+function Window:Slider(label, value, min, max, stepv, fmt, cb, colorFn)
+    local f = self:Row(64)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0.5, -10, 0, 20)
+    l.Position = UDim2.new(0, 14, 0, 8)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.GothamMedium
+    l.TextSize = 13
+    l.TextColor3 = T.text
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    l.Text = label
+    l.Parent = f
+
+    local val = Instance.new("TextLabel")
+    val.Size = UDim2.new(0.5, -14, 0, 20)
+    val.Position = UDim2.new(0.5, 0, 0, 8)
+    val.BackgroundTransparency = 1
+    val.Font = Enum.Font.GothamBold
+    val.TextSize = 13
+    val.TextColor3 = T.green
+    val.TextXAlignment = Enum.TextXAlignment.Right
+    val.Parent = f
+
+    local trackH = 8
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, -28, 0, trackH)
+    track.Position = UDim2.new(0, 14, 0, 38)
+    track.BackgroundColor3 = T.line
+    track.BorderSizePixel = 0
+    track.Parent = f
+    corner(track, trackH / 2)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = T.accent
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    corner(fill, trackH / 2)
+
+    local KS = 18
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(KS, KS)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Position = UDim2.new(0, 0, 0.5, 0)
+    knob.BackgroundColor3 = T.white
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 2
+    knob.Parent = track
+    corner(knob, KS / 2)
+    local knobEdge = stroke(knob, T.accent, 2)
+
+    local cur = value
+    local function paint()
+        local txt, col
+        if colorFn then txt, col = colorFn(cur) end
+        val.Text = txt or (fmt and fmt(cur)) or tostring(cur)
+        local c = col or T.green
+        val.TextColor3 = c
+        fill.BackgroundColor3 = c
+        knobEdge.Color = c
+        local t = math.clamp((cur - min) / (max - min), 0, 1)
+        fill.Size = UDim2.new(t, 0, 1, 0)
+        knob.Position = UDim2.new(t, 0, 0.5, 0)
+    end
+    paint()
+
+    local function setFromX(absX)
+        local tPos, tW = track.AbsolutePosition.X, track.AbsoluteSize.X
+        if tW < 1 then return end
+        local t = math.clamp((absX - tPos) / tW, 0, 1)
+        local raw = min + t * (max - min)
+        cur = math.clamp(math.floor(raw / stepv + 0.5) * stepv, min, max)
+        paint()
+        if cb then cb(cur) end
+    end
+
+    local sliding = false
+    local function begin(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = true
+            setFromX(input.Position.X)
+        end
+    end
+    track.InputBegan:Connect(begin)
+    knob.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = true
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not sliding then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            setFromX(input.Position.X)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            sliding = false
+        end
+    end)
+
+    return {
+        Frame = f,
+        Set = function(_, v) cur = math.clamp(v, min, max) paint() end,
+        Get = function() return cur end,
+    }
+end
+
+function Window:Button(label, cb)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, 42)
+    b.BackgroundColor3 = T.btnBg
+    b.BackgroundTransparency = ToolUI.RowAlpha
+    b.BorderSizePixel = 0
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.TextColor3 = T.text
+    b.Text = label
+    b.AutoButtonColor = false
+    b.LayoutOrder = self:_next()
+    b.Parent = self.Body
+    corner(b, 11)
+    stroke(b, T.line, 1, 0.3)
+    addGlint(b)
+
+    local bs = Instance.new("UIScale")
+    bs.Parent = b
+
+    b.MouseEnter:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.btnHi }) end)
+    b.MouseLeave:Connect(function() tween(b, 0.12, { BackgroundColor3 = T.btnBg }) end)
+    b.MouseButton1Click:Connect(function()
+        -- Hundir y soltar: en tactil no hay hover, sin esto no hay forma de saber
+        -- si el toque ha entrado.
+        tween(bs, 0.07, { Scale = 0.97 }, Enum.EasingStyle.Quad)
+        task.delay(0.07, function() tween(bs, 0.16, { Scale = 1 }, Enum.EasingStyle.Back) end)
+        if cb then task.spawn(cb) end
+    end)
+
+    return { Instance = b, SetText = function(_, t) b.Text = t end }
+end
+
+-- ============================================================================
+-- COMPORTAMIENTO DE LA VENTANA
+-- ============================================================================
+-- El halo cuelga del propio Panel y va a Scale 1,1 con offset, asi que se pliega
+-- y se arrastra solo. Una version anterior tenia una sombra suelta que habia que
+-- mover a mano y se descolgaba en cuanto las dos animaciones se solapaban.
+function Window:Fold(force)
+    local want = (force == nil) and (not self.folded) or (force and true or false)
+    if want == self.folded then return end
+    self.folded = want
+
+    local lbl = self.FoldBtn:FindFirstChildWhichIsA("TextLabel")
+    if lbl then lbl.Text = want and "+" or "-" end
+
+    if want then
+        self.Body.Visible = false
+        tween(self.Panel, 0.26, { Size = UDim2.fromOffset(self.W, self.HeadH) })
+    else
+        tween(self.Panel, 0.26, { Size = UDim2.fromOffset(self.W, self.H) })
+        -- Enseñar el cuerpo cuando el panel ya tiene sitio: si no, se ve la lista
+        -- recortada durante el crecimiento.
+        task.delay(0.1, function() self.Body.Visible = true end)
+    end
+end
+
+function Window:_wireDrag()
+    local dragging, startPos, startMouse
+    self.Head.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            startPos = self.Panel.Position
+            startMouse = input.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - startMouse
+            self.Panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+function Window:_wireHideKey(key)
+    if key == false then return end
+    key = key or Enum.KeyCode.RightShift
+    UIS.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.KeyCode == key then self.Gui.Enabled = not self.Gui.Enabled end
+    end)
+end
+
+function Window:Show()  self.Gui.Enabled = true  end
+function Window:Hide()  self.Gui.Enabled = false end
+function Window:ToggleVisible() self.Gui.Enabled = not self.Gui.Enabled end
+
+function Window:SetTitle(text, col)
+    self.Title.Text = text
+    if col then self.Title.TextColor3 = col end
+end
+
+function Window:SetSubtitle(text) self.Sub.Text = text end
+
+-- Punto de estado. `Pulse(true)` lo pone a latir en verde; `Pulse(false)` lo deja
+-- fijo y apagado. El latido solo se recalcula mientras esta encendido, para no
+-- tener un bucle corriendo sin motivo.
+function Window:Pulse(on, col)
+    self._pulse = on and true or false
+    self._pulseCol = col or T.accent
+    if self._pulseThread then return end
+    self._pulseThread = task.spawn(function()
+        local t = 0
+        while self.Gui and self.Gui.Parent do
+            task.wait(0.08)
+            if self._pulse then
+                t = t + 0.08
+                local k = 0.5 + 0.5 * math.sin(t * 4)
+                self.Live.BackgroundColor3 = self._pulseCol:Lerp(T.bg, k * 0.55)
+            else
+                self.Live.BackgroundColor3 = T.dim
+            end
+        end
+        self._pulseThread = nil
+    end)
+end
+
+function Window:SetDot(col)
+    self._pulse = false
+    self.Live.BackgroundColor3 = col
+end
+
+-- Entrada: el panel se desliza desde su lado creciendo de 0.9 a 1. El Quint/Out
+-- frena muy tarde, o sea que parece que tiene peso en vez del arranque plano de
+-- un lineal. Las filas entran detras, escalonadas.
+function Window:Build()
+    if self.built then return self end
+    self.built = true
+
+    local restPos = self.Panel.Position
+    local dx = (self.Panel.AnchorPoint.X == 1) and 60 or -60
+    self.Panel.Position = UDim2.new(restPos.X.Scale, restPos.X.Offset + dx,
+                                    restPos.Y.Scale, restPos.Y.Offset)
+    self.Panel.BackgroundTransparency = 1
+    self.PanelEdge.Transparency = 1
+    for _, g in ipairs(self.Glow) do g.BackgroundTransparency = 1 end
+
+    tween(self.Panel, 0.42, { Position = restPos,
+                              BackgroundTransparency = ToolUI.PanelAlpha })
+    tween(self.Scale, 0.5, { Scale = 1 }, Enum.EasingStyle.Back)
+    tween(self.PanelEdge, 0.42, { Transparency = 0 })
+    for i, g in ipairs(self.Glow) do
+        tween(g, 0.42, { BackgroundTransparency = 0.55 + i * 0.13 })
+    end
+
+    local idx = 0
+    for _, c in ipairs(self.Body:GetChildren()) do
+        if not c:IsA("UIListLayout") then
+            idx = idx + 1
+            animateIn(c, idx)
+        end
+    end
+    return self
+end
+
+function Window:Destroy()
+    self._pulse = false
+    if self.Gui then self.Gui:Destroy() end
+end
+
+-- Limpia paneles y avisos que hayan quedado de una ejecucion anterior. Sin esto,
+-- reejecutar el script deja la ventana vieja flotando encima de la nueva y parece
+-- que hay dos hubs cargados.
+function ToolUI:Cleanup(names)
+    names = names or { "ToolUI", "ToolUI_Notify" }
+    local h = host()
+    for _, g in ipairs(h:GetChildren()) do
+        for _, n in ipairs(names) do
+            if g.Name == n then pcall(function() g:Destroy() end) end
+        end
+    end
+    Notif.gui, Notif.holder, Notif.live = nil, nil, {}
+end
+
+return ToolUI
